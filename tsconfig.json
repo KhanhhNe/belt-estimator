@@ -1,0 +1,24 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "CommonJS",
+		"moduleResolution": "Node",
+		"ignoreDeprecations": "6.0",
+		"allowJs": true,
+		"checkJs": true,
+		"noEmit": true,
+		"strict": false,
+		"skipLibCheck": true,
+		"esModuleInterop": true,
+		"forceConsistentCasingInFileNames": true,
+		"lib": ["ES2022", "DOM"],
+		"types": ["node"]
+	},
+	"include": [
+		"src/**/*.js",
+		"scripts/**/*.js",
+		"public/**/*.js",
+		"drizzle.config.js"
+	],
+	"exclude": ["node_modules", "drizzle"]
+}

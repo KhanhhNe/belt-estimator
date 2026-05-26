@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BELT Attendance Dashboard</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="stats-page">
+    <header class="stats-header">
+      <p class="stats-eyebrow">Microsoft BELT Tracker</p>
+      <h1 class="stats-title">Attendance Compliance Snapshot</h1>
+      <p class="stats-subtitle">All values and calendar highlights come from <code>/api/stats</code> (backend only).</p>
+    </header>
+
+    <section id="stats-grid" class="stats-grid" aria-live="polite">
+      <article class="stat-card stat-card-loading">
+        <p class="stat-label">Loading</p>
+        <p class="stat-value">Fetching latest stats...</p>
+      </article>
+    </section>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>
