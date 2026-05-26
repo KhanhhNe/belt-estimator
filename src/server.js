@@ -3,16 +3,37 @@ const express = require("express");
 const path = require("node:path");
 const { db } = require("./db/client");
 const { attendanceRecords } = require("./db/schema");
-const { getBeltStats } = require("./services/beltStats");
+const {
+	getBeltStats,
+	getBeltStatsFromAttendedDateStrings,
+} = require("./services/beltStats");
 
 const app = express();
 const port = process.env.PORT || 3000;
 
+app.use(express.json());
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 function getUtcPlus7DateString(now = new Date()) {
 	const localTimeInUtcPlus7 = new Date(now.getTime() + 7 * 60 * 60 * 1000);
 	return localTimeInUtcPlus7.toISOString().slice(0, 10);
+}
+
+function isValidIsoDate(dateString) {
+	if (typeof dateString !== "string") {
+		return false;
+	}
+
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(dateString)) {
+		return false;
+	}
+
+	const parsed = new Date(`${dateString}T00:00:00.000Z`);
+	if (Number.isNaN(parsed.getTime())) {
+		return false;
+	}
+
+	return parsed.toISOString().slice(0, 10) === dateString;
 }
 
 app.post("/api/record-attendance", async (_req, res) => {
@@ -42,14 +63,49 @@ app.post("/api/record-attendance", async (_req, res) => {
 	}
 });
 
+app.post("/api/stats/preview", async (req, res) => {
+	try {
+		const requestedDates = req.body?.attendedDateStrings;
+		if (!Array.isArray(requestedDates)) {
+			res.status(400).json({
+				error: "Invalid attendedDateStrings",
+				details: "Provide an array of ISO dates (YYYY-MM-DD)",
+			});
+			return;
+		}
+
+		const invalidDate = requestedDates.find(
+			(dateString) => !isValidIsoDate(dateString),
+		);
+		if (invalidDate) {
+			res.status(400).json({
+				error: "Invalid date",
+				details: `Invalid ISO date: ${invalidDate}`,
+			});
+			return;
+		}
+
+		const stats = getBeltStatsFromAttendedDateStrings(requestedDates);
+
+		res.json(stats);
+	} catch (error) {
+		res.status(500).json({
+			error: "Failed to compute preview stats",
+			details: error.message,
+		});
+	}
+});
+
 app.get("/api/stats", async (_req, res) => {
 	try {
-		const stats = await getBeltStats();
+		const stats = await getBeltStats(db);
 
 		res.json({
 			_docs: {
 				recordAttendance:
 					"POST /api/record-attendance records today's date using UTC+7 timezone. Idempotent: repeated calls for the same UTC+7 day do not create duplicates.",
+				previewStats:
+					"POST /api/stats/preview accepts attendedDateStrings (array of YYYY-MM-DD) and returns recomputed BELT stats without writing to database.",
 				currentBeltStat:
 					"Average attended weekdays across the best 8 weeks within the trailing 12-week window. Compare this value against 3.0.",
 				sumBestEight:
@@ -57,9 +113,9 @@ app.get("/api/stats", async (_req, res) => {
 				currentMonthAttendance:
 					"Number of attended weekdays recorded in the current calendar month up to today.",
 				currentMonthAttendanceDates:
-					"ISO date list (YYYY-MM-DD) of attended weekdays in the current month up to today. Intended for calendar highlighting.",
+					"ISO date list (YYYY-MM-DD) of attended dates in the current month. Intended for calendar highlighting and click-to-toggle UI state.",
 				currentDate:
-					"Current date in ISO format (YYYY-MM-DD) used by backend while computing stats.",
+					"Current date in ISO format (YYYY-MM-DD) using UTC+7 day boundary used by backend while computing stats.",
 				bestEightBreakdown:
 					"Sorted counts selected as the best 8 weeks from the trailing 12-week window (used to compute sumBestEight).",
 				trailingTwelveBreakdown:

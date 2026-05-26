@@ -1,5 +1,4 @@
 const { asc } = require("drizzle-orm");
-const { db } = require("../db/client");
 const { attendanceRecords } = require("../db/schema");
 
 const TOTAL_WEEKS = 12;
@@ -19,6 +18,17 @@ function formatIsoDate(date) {
 function utcDateOnly(date) {
 	return new Date(
 		Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
+	);
+}
+
+function utcPlus7DateOnly(date) {
+	const shifted = new Date(date.getTime() + 7 * 60 * 60 * 1000);
+	return new Date(
+		Date.UTC(
+			shifted.getUTCFullYear(),
+			shifted.getUTCMonth(),
+			shifted.getUTCDate(),
+		),
 	);
 }
 
@@ -124,15 +134,11 @@ function getCurrentMonthAttendanceDateStrings(attendedDateStrings, asOfDate) {
 	return uniqueDateStrings
 		.filter((dateString) => {
 			const date = parseIsoDate(dateString);
-			if (date > asOf) {
-				return false;
-			}
-
 			if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month) {
 				return false;
 			}
 
-			return isWeekday(date);
+			return true;
 		})
 		.sort((left, right) => left.localeCompare(right));
 }
@@ -157,6 +163,7 @@ function computeMaximumConsecutiveWfhDays({
 	attendedDateStrings,
 	today,
 	todayAttended,
+	startDateOverride = null,
 }) {
 	const scenarioDates = new Set(attendedDateStrings);
 	const todayIso = formatIsoDate(today);
@@ -167,7 +174,9 @@ function computeMaximumConsecutiveWfhDays({
 		scenarioDates.delete(todayIso);
 	}
 
-	const firstWfhDate = getWfhStartDate(today, todayAttended);
+	const firstWfhDate = startDateOverride
+		? nextWeekday(startDateOverride)
+		: getWfhStartDate(today, todayAttended);
 
 	let maxAllowed = 0;
 	let weekdayWfhCount = 0;
@@ -190,7 +199,7 @@ function computeMaximumConsecutiveWfhDays({
 	return maxAllowed;
 }
 
-async function fetchAttendedDateStrings() {
+async function fetchAttendedDateStrings(db) {
 	const rows = await db
 		.selectDistinct({ date: attendanceRecords.date })
 		.from(attendanceRecords)
@@ -199,30 +208,57 @@ async function fetchAttendedDateStrings() {
 	return rows.map((row) => row.date);
 }
 
-async function getBeltStats(now = new Date()) {
-	const today = utcDateOnly(now);
+function getBeltStatsFromAttendedDateStrings(
+	attendedDateStrings,
+	now = new Date(),
+) {
+	const today = utcPlus7DateOnly(now);
 	const todayIso = formatIsoDate(today);
-	const attendedDateStrings = await fetchAttendedDateStrings();
-	const attendedDateSet = new Set(attendedDateStrings);
+	const normalizedAttendedDateStrings = [...new Set(attendedDateStrings)].sort(
+		(left, right) => left.localeCompare(right),
+	);
+	const attendedDateSet = new Set(normalizedAttendedDateStrings);
+	const latestSelectedIso =
+		normalizedAttendedDateStrings[normalizedAttendedDateStrings.length - 1] ??
+		todayIso;
+	const latestSelectedDate = parseIsoDate(latestSelectedIso);
+	const beltStatAsOfDate =
+		latestSelectedDate > today ? latestSelectedDate : today;
 
-	const current = calculateBeltStat(attendedDateStrings, today);
+	const current = calculateBeltStat(
+		normalizedAttendedDateStrings,
+		beltStatAsOfDate,
+	);
 	const currentMonthAttendance = calculateCurrentMonthAttendance(
-		attendedDateStrings,
+		normalizedAttendedDateStrings,
 		today,
 	);
 	const currentMonthAttendanceDates = getCurrentMonthAttendanceDateStrings(
-		attendedDateStrings,
+		normalizedAttendedDateStrings,
 		today,
 	);
 	const maxIfTodayAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings,
+		attendedDateStrings: normalizedAttendedDateStrings,
 		today,
 		todayAttended: true,
 	});
 	const maxIfTodayNotAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings,
+		attendedDateStrings: normalizedAttendedDateStrings,
 		today,
 		todayAttended: false,
+	});
+	const deltaComparisonStartDate = nextWeekday(addDays(today, 1));
+	const deltaIfTodayAttended = computeMaximumConsecutiveWfhDays({
+		attendedDateStrings: normalizedAttendedDateStrings,
+		today,
+		todayAttended: true,
+		startDateOverride: deltaComparisonStartDate,
+	});
+	const deltaIfTodayNotAttended = computeMaximumConsecutiveWfhDays({
+		attendedDateStrings: normalizedAttendedDateStrings,
+		today,
+		todayAttended: false,
+		startDateOverride: deltaComparisonStartDate,
 	});
 	const wfhStartDateIfTodayAttended = formatIsoDate(
 		getWfhStartDate(today, true),
@@ -234,6 +270,7 @@ async function getBeltStats(now = new Date()) {
 	const todayWasAttended = attendedDateSet.has(todayIso);
 
 	return {
+		attendedDateStrings: normalizedAttendedDateStrings,
 		currentBeltStat: Number(current.average.toFixed(3)),
 		sumBestEight: current.sumBestEight,
 		currentMonthAttendance,
@@ -242,22 +279,30 @@ async function getBeltStats(now = new Date()) {
 		maximumConsecutiveWfhDays: todayWasAttended
 			? maxIfTodayAttended
 			: maxIfTodayNotAttended,
-		nextDayAttendanceStatChange: maxIfTodayAttended - maxIfTodayNotAttended,
+		nextDayAttendanceStatChange: deltaIfTodayAttended - deltaIfTodayNotAttended,
 		metadata: {
 			windowWeeks: TOTAL_WEEKS,
 			bestWeeksUsed: BEST_WEEKS_COUNT,
 			currentWeekIncluded: true,
+			beltStatAsOfDate: formatIsoDate(beltStatAsOfDate),
 			currentWeekAttendance: current.currentWeekAttendance,
 			bestEightBreakdown: current.selectedCounts,
 			trailingTwelveBreakdown: current.weeklyCounts,
 			wfhStartDateIfTodayAttended,
 			wfhStartDateIfTodayNotAttended,
+			deltaComparisonStartDate: formatIsoDate(deltaComparisonStartDate),
 			complianceThreshold: COMPLIANCE_THRESHOLD,
 			todayWasAttended,
 		},
 	};
 }
 
+async function getBeltStats(db, now = new Date()) {
+	const attendedDateStrings = await fetchAttendedDateStrings(db);
+	return getBeltStatsFromAttendedDateStrings(attendedDateStrings, now);
+}
+
 module.exports = {
 	getBeltStats,
+	getBeltStatsFromAttendedDateStrings,
 };

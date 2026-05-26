@@ -1,6 +1,6 @@
 # belt-estimator
 
-Express.js starter application.
+BELT attendance dashboard with Node.js local server and Cloudflare Workers deployment.
 
 ## Prerequisites
 
@@ -22,6 +22,13 @@ Required keys:
 - `TURSO_AUTH_TOKEN`
 - `PORT`
 
+For local Cloudflare Worker development, create `.dev.vars` from `.dev.vars.example`.
+
+Required keys:
+
+- `TURSO_DATABASE_URL`
+- `TURSO_AUTH_TOKEN`
+
 ## Run
 
 ```bash
@@ -39,6 +46,37 @@ Database ping endpoint:
 ```bash
 npm start
 ```
+
+## Cloudflare Workers setup
+
+Wrangler is installed locally in this project.
+
+1. Authenticate with Cloudflare:
+
+```bash
+npx wrangler login
+```
+
+2. Set Worker secrets in Cloudflare:
+
+```bash
+npm run cf:secret:url
+npm run cf:secret:token
+```
+
+3. Run Worker locally:
+
+```bash
+npm run cf:dev
+```
+
+4. Deploy to Cloudflare:
+
+```bash
+npm run cf:deploy
+```
+
+Worker configuration lives in `wrangler.jsonc`.
 
 ## Drizzle commands
 
