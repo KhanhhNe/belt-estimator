@@ -38,6 +38,18 @@ function getUtcPlus7DateString(now = new Date()) {
 	return localTimeInUtcPlus7.toISOString().slice(0, 10);
 }
 
+function maskUniqueCode(value = "") {
+	if (!value) {
+		return "[missing]";
+	}
+
+	if (value.length <= 4) {
+		return "****";
+	}
+
+	return `${value.slice(0, 2)}****${value.slice(-2)}`;
+}
+
 function isValidIsoDate(dateString) {
 	if (typeof dateString !== "string") {
 		return false;
@@ -248,12 +260,31 @@ function getDbForEnv(env) {
 }
 
 async function handleRecordAttendance(env, request) {
+	const requestId = request.headers.get("x-request-id") ?? crypto.randomUUID();
+	const requestStartedAt = Date.now();
+	const requestUrl = new URL(request.url);
+	const logPrefix = `[record-attendance][${requestId}]`;
+
 	try {
 		const attendanceDate = getUtcPlus7DateString();
 		const db = getDbForEnv(env);
 		const userUniqueCode = request.headers.get("User-Unique-Code")?.trim();
 
+		console.log(
+			`${logPrefix} Request received`,
+			JSON.stringify({
+				method: request.method,
+				path: requestUrl.pathname,
+				date: attendanceDate,
+				hasUniqueCode: Boolean(userUniqueCode),
+				uniqueCodeHint: maskUniqueCode(userUniqueCode ?? ""),
+			}),
+		);
+
 		if (!userUniqueCode) {
+			console.warn(
+				`${logPrefix} Missing User-Unique-Code header after ${Date.now() - requestStartedAt}ms`,
+			);
 			return json(
 				{
 					error: "Missing User-Unique-Code",
@@ -272,6 +303,13 @@ async function handleRecordAttendance(env, request) {
 
 		const matchedUser = matchedUsers[0];
 		if (!matchedUser) {
+			console.warn(
+				`${logPrefix} Invalid unique code`,
+				JSON.stringify({
+					uniqueCodeHint: maskUniqueCode(userUniqueCode),
+					durationMs: Date.now() - requestStartedAt,
+				}),
+			);
 			return json(
 				{
 					error: "Invalid User-Unique-Code",
@@ -290,6 +328,16 @@ async function handleRecordAttendance(env, request) {
 			.returning({ insertedDate: attendanceRecords.date });
 
 		const created = result.length > 0;
+		console.log(
+			`${logPrefix} Attendance write completed`,
+			JSON.stringify({
+				created,
+				date: attendanceDate,
+				userId: matchedUser.id,
+				username: matchedUser.username,
+				durationMs: Date.now() - requestStartedAt,
+			}),
+		);
 
 		return json({
 			created,
@@ -300,6 +348,14 @@ async function handleRecordAttendance(env, request) {
 				: "Attendance already exists for this UTC+7 date",
 		});
 	} catch (error) {
+		console.error(
+			`${logPrefix} Failed to record attendance`,
+			JSON.stringify({
+				durationMs: Date.now() - requestStartedAt,
+				errorMessage: error?.message,
+				stack: error?.stack,
+			}),
+		);
 		return json(
 			{
 				error: "Failed to record attendance",

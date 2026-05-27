@@ -1,5 +1,7 @@
 require("dotenv").config({ quiet: true });
 const express = require("express");
+const { randomUUID } = require("node:crypto");
+const { STATUS_CODES } = require("node:http");
 const path = require("node:path");
 
 const app = express();
@@ -9,6 +11,62 @@ const workerModulePromise = import("./worker.mjs");
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "..", "public")));
+
+function redactRequestBody(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return value;
+	}
+
+	const redacted = {};
+	for (const [key, nestedValue] of Object.entries(value)) {
+		if (
+			key.toLowerCase().includes("password") ||
+			key.toLowerCase().includes("hash")
+		) {
+			redacted[key] = "[FILTERED]";
+			continue;
+		}
+
+		redacted[key] = nestedValue;
+	}
+
+	return redacted;
+}
+
+app.use("/api", (req, res, next) => {
+	const requestId = randomUUID();
+	const startedAt = Date.now();
+	const startedIso = new Date(startedAt).toISOString();
+	const remoteIp =
+		req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() ||
+		req.socket.remoteAddress ||
+		req.ip;
+	const format = req.is("application/json") ? "JSON" : "HTML";
+	const safeParams = redactRequestBody(req.body ?? {});
+
+	res.locals.requestId = requestId;
+	res.setHeader("x-request-id", requestId);
+
+	console.log(
+		`[${requestId}] Started ${req.method} "${req.originalUrl}" for ${remoteIp} at ${startedIso}`,
+	);
+	console.log(`[${requestId}] Processing by WorkerProxy as ${format}`);
+	if (Object.keys(safeParams).length > 0) {
+		console.log(`[${requestId}]   Parameters: ${JSON.stringify(safeParams)}`);
+	}
+
+	res.on("finish", () => {
+		const durationMs = Date.now() - startedAt;
+		const statusCode = res.statusCode;
+		const statusText = STATUS_CODES[statusCode] ?? "Unknown";
+		const responseLength = res.getHeader("content-length") ?? "unknown";
+		console.log(
+			`[${requestId}] Completed ${statusCode} ${statusText} in ${durationMs}ms (Bytes: ${responseLength})`,
+		);
+	});
+
+	next();
+});
 
 function createWorkerEnv() {
 	return {
@@ -51,6 +109,10 @@ app.use("/api", async (req, res) => {
 		if (req.method !== "GET" && req.method !== "HEAD") {
 			body = JSON.stringify(req.body ?? {});
 			headers.set("content-type", "application/json");
+		}
+
+		if (res.locals.requestId) {
+			headers.set("x-request-id", res.locals.requestId);
 		}
 
 		const request = new Request(requestUrl, {
