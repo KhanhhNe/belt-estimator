@@ -325,9 +325,6 @@ body {
 	width: 100%;
 }
 
-.unique-code-card {
-}
-
 .stat-panel,
 .calendar-panel,
 .stat-card {
@@ -659,6 +656,23 @@ body {
 	pointer-events: none;
 }
 
+@keyframes preview-loading-pulse {
+	0% {
+		opacity: 0.72;
+		transform: scale(0.995);
+	}
+
+	50% {
+		opacity: 1;
+		transform: scale(1);
+	}
+
+	100% {
+		opacity: 0.72;
+		transform: scale(0.995);
+	}
+}
+
 .calendar-cell-empty {
 	background: transparent;
 	border-color: transparent;
@@ -838,4 +852,14 @@ body {
 	.calendar-day-number {
 		font-size: 0.9rem;
 	}
+}
+
+.dashboard-layout-preview-loading .compact-stat-tile,
+.dashboard-layout-preview-loading .calendar-month-nav {
+	animation: preview-loading-pulse 1.05s ease-in-out infinite;
+}
+
+.dashboard-layout-preview-loading .calendar-usage-hint {
+	color: var(--accent);
+	animation: preview-loading-pulse 1.05s ease-in-out infinite;
 }

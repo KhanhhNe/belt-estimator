@@ -9,6 +9,11 @@ let authViewMode = "login";
 let forgotPasswordResult = null;
 let forgotPasswordDraft = null;
 let uniqueCodeVisible = false;
+let attendancePreviewDebounceTimer = null;
+let attendancePreviewVersion = 0;
+let attendancePreviewRequestId = 0;
+
+const ATTENDANCE_PREVIEW_DEBOUNCE_MS = 300;
 
 function escapeHtml(value) {
 	return `${value}`
@@ -30,6 +35,18 @@ function setStatsLocked(isLocked) {
 	} else {
 		statsShell.classList.remove("stats-shell-locked");
 	}
+}
+
+function renderCurrentStatsPreview() {
+	const statsGrid = document.getElementById("stats-grid");
+	if (!statsGrid || !latestStatsPayload) {
+		return;
+	}
+
+	renderStats(statsGrid, {
+		...latestStatsPayload,
+		attendedDateStrings: [...workingAttendedDateSet],
+	});
 }
 
 function renderAuthUi() {
@@ -407,8 +424,15 @@ function renderStats(target, payload) {
 		)
 		.join("");
 
+	const dashboardLoadingClass = attendanceUpdateInFlight
+		? " dashboard-layout-preview-loading"
+		: "";
+	const usageHintText = attendanceUpdateInFlight
+		? "Updating preview..."
+		: "Tip: Click any date to preview stat changes.";
+
 	target.innerHTML = `
-		<section class="dashboard-layout">
+		<section class="dashboard-layout${dashboardLoadingClass}">
 			<article class="calendar-panel">
 				<div class="calendar-header-row">
 					<div class="calendar-month-nav" role="group" aria-label="Calendar month navigation">
@@ -426,7 +450,7 @@ function renderStats(target, payload) {
 					<span class="calendar-legend-item"><span class="calendar-legend-dot calendar-legend-dot-attended-user"></span>User updated</span>
 					<span class="calendar-legend-item"><span class="calendar-legend-dot calendar-legend-dot-today"></span>Today</span>
 				</div>
-				<p class="calendar-usage-hint">Tip: Click any date to preview stat changes.</p>
+				<p class="calendar-usage-hint">${usageHintText}</p>
 			</article>
 
 			<article class="stat-panel">
@@ -472,11 +496,58 @@ async function recalculatePreviewStats(attendedDateStrings) {
 	return response.json();
 }
 
-async function handleAttendanceToggleCell(calendarCell) {
-	if (attendanceUpdateInFlight) {
+function scheduleAttendancePreviewRefresh() {
+	if (attendancePreviewDebounceTimer) {
+		window.clearTimeout(attendancePreviewDebounceTimer);
+	}
+
+	const scheduledVersion = attendancePreviewVersion;
+	attendancePreviewDebounceTimer = window.setTimeout(() => {
+		attendancePreviewDebounceTimer = null;
+		void flushAttendancePreviewRefresh(scheduledVersion);
+	}, ATTENDANCE_PREVIEW_DEBOUNCE_MS);
+}
+
+async function flushAttendancePreviewRefresh(scheduledVersion) {
+	if (!currentUser || scheduledVersion !== attendancePreviewVersion) {
 		return;
 	}
 
+	const requestId = ++attendancePreviewRequestId;
+	attendanceUpdateInFlight = true;
+	renderCurrentStatsPreview();
+
+	try {
+		const previewStats = await recalculatePreviewStats([
+			...workingAttendedDateSet,
+		]);
+		if (
+			requestId !== attendancePreviewRequestId ||
+			scheduledVersion !== attendancePreviewVersion
+		) {
+			return;
+		}
+
+		latestStatsPayload = previewStats;
+		renderCurrentStatsPreview();
+	} catch (error) {
+		if (
+			requestId !== attendancePreviewRequestId ||
+			scheduledVersion !== attendancePreviewVersion
+		) {
+			return;
+		}
+
+		console.error("Failed to refresh attendance preview", error);
+	} finally {
+		if (requestId === attendancePreviewRequestId) {
+			attendanceUpdateInFlight = false;
+			renderCurrentStatsPreview();
+		}
+	}
+}
+
+async function handleAttendanceToggleCell(calendarCell) {
 	const dateString = calendarCell.dataset.date;
 	if (!dateString) {
 		return;
@@ -489,27 +560,9 @@ async function handleAttendanceToggleCell(calendarCell) {
 		workingAttendedDateSet.delete(dateString);
 	}
 
-	attendanceUpdateInFlight = true;
-	calendarCell.classList.add("calendar-cell-updating");
-
-	try {
-		const previewStats = await recalculatePreviewStats([
-			...workingAttendedDateSet,
-		]);
-		const statsGrid = document.getElementById("stats-grid");
-		latestStatsPayload = previewStats;
-		renderStats(statsGrid, previewStats);
-	} catch (error) {
-		if (shouldMarkAttended) {
-			workingAttendedDateSet.delete(dateString);
-		} else {
-			workingAttendedDateSet.add(dateString);
-		}
-		console.error("Failed to toggle attendance", error);
-	} finally {
-		attendanceUpdateInFlight = false;
-		calendarCell.classList.remove("calendar-cell-updating");
-	}
+	attendancePreviewVersion += 1;
+	renderCurrentStatsPreview();
+	scheduleAttendancePreviewRefresh();
 }
 
 function registerCalendarInteractions() {
