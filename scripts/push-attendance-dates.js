@@ -36,19 +36,29 @@ const ATTENDANCE_DATES = [
 ];
 
 async function upsertAttendanceDates(dates) {
+	const userLookup = await client.execute({
+		sql: "select id from users where username = ? limit 1",
+		args: ["khanhhne"],
+	});
+
+	const userId = userLookup.rows?.[0]?.id;
+	if (!userId) {
+		throw new Error("User khanhhne not found. Run migrations first.");
+	}
+
 	let inserted = 0;
 	let skipped = 0;
 
 	for (const date of dates) {
 		const result = await client.execute({
 			sql: `
-				insert into attendance_records (date)
-				select ?
+				insert into attendance_records (date, user_id)
+				select ?, ?
 				where not exists (
-					select 1 from attendance_records where date = ?
+					select 1 from attendance_records where date = ? and user_id = ?
 				)
 			`,
-			args: [date, date],
+			args: [date, userId, date, userId],
 		});
 
 		if (result.rowsAffected === 1) {

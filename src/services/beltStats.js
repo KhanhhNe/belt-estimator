@@ -1,4 +1,4 @@
-const { asc } = require("drizzle-orm");
+const { asc, eq } = require("drizzle-orm");
 const { attendanceRecords } = require("../db/schema");
 
 const TOTAL_WEEKS = 12;
@@ -199,10 +199,11 @@ function computeMaximumConsecutiveWfhDays({
 	return maxAllowed;
 }
 
-async function fetchAttendedDateStrings(db) {
+async function fetchAttendedDateStrings(db, userId) {
 	const rows = await db
 		.selectDistinct({ date: attendanceRecords.date })
 		.from(attendanceRecords)
+		.where(eq(attendanceRecords.userId, userId))
 		.orderBy(asc(attendanceRecords.date));
 
 	return rows.map((row) => row.date);
@@ -297,8 +298,8 @@ function getBeltStatsFromAttendedDateStrings(
 	};
 }
 
-async function getBeltStats(db, now = new Date()) {
-	const attendedDateStrings = await fetchAttendedDateStrings(db);
+async function getBeltStats(db, userId, now = new Date()) {
+	const attendedDateStrings = await fetchAttendedDateStrings(db, userId);
 	return getBeltStatsFromAttendedDateStrings(attendedDateStrings, now);
 }
 

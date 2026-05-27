@@ -12,16 +12,32 @@
 <body>
   <main class="stats-page">
     <header class="stats-header">
-      <p class="stats-eyebrow">Microsoft BELT Tracker</p>
-      <h1 class="stats-title">Attendance Compliance Snapshot</h1>
+      <div class="header-top-row">
+        <div>
+          <p class="stats-eyebrow">Microsoft BELT Tracker</p>
+          <h1 class="stats-title">Attendance Compliance Snapshot</h1>
+          <p id="auth-greeting" class="stats-subtitle">Checking authentication...</p>
+        </div>
+        <div id="auth-action-bar" class="auth-action-bar"></div>
+      </div>
     </header>
 
-    <section id="stats-grid" class="stats-grid" aria-live="polite">
-      <article class="stat-card stat-card-loading">
-        <p class="stat-label">Loading</p>
-        <p class="stat-value">Fetching latest stats...</p>
-      </article>
+    <section id="auth-panel" class="auth-panel" aria-live="polite"></section>
+
+    <section id="stats-shell" class="stats-shell stats-shell-locked" aria-live="polite">
+      <div id="stats-grid" class="stats-grid">
+        <article class="stat-card stat-card-loading">
+          <p class="stat-label">Loading</p>
+          <p class="stat-value">Fetching latest stats...</p>
+        </article>
+      </div>
+      <div id="stats-lock-overlay" class="stats-lock-overlay">
+        <p class="stats-lock-title">Authentication Required</p>
+        <p class="stats-lock-text">Log in or register to view your BELT stats.</p>
+      </div>
     </section>
+
+    <section id="unique-code-footer" class="unique-code-footer" hidden></section>
   </main>
   <script src="/app.js" defer></script>
 </body>

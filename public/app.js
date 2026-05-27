@@ -3,13 +3,187 @@ let baselineAttendedDateSet = new Set();
 let workingAttendedDateSet = new Set();
 let latestStatsPayload = null;
 let viewedMonthDateString = null;
+let currentUser = null;
+let authPanelMessage = "";
+let authViewMode = "login";
+let forgotPasswordResult = null;
+let forgotPasswordDraft = null;
+let uniqueCodeVisible = false;
+
+function escapeHtml(value) {
+	return `${value}`
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;")
+		.replaceAll('"', "&quot;")
+		.replaceAll("'", "&#39;");
+}
+
+function setStatsLocked(isLocked) {
+	const statsShell = document.getElementById("stats-shell");
+	if (!statsShell) {
+		return;
+	}
+
+	if (isLocked) {
+		statsShell.classList.add("stats-shell-locked");
+	} else {
+		statsShell.classList.remove("stats-shell-locked");
+	}
+}
+
+function renderAuthUi() {
+	const greetingElement = document.getElementById("auth-greeting");
+	const actionBar = document.getElementById("auth-action-bar");
+	const authPanel = document.getElementById("auth-panel");
+	const uniqueCodeFooter = document.getElementById("unique-code-footer");
+
+	if (!greetingElement || !actionBar || !authPanel || !uniqueCodeFooter) {
+		return;
+	}
+
+	if (currentUser) {
+		greetingElement.textContent = `Hello ${currentUser.username} on home`;
+		actionBar.innerHTML = `
+			<button type="button" class="auth-button auth-button-danger" data-auth-action="logout">Logout</button>
+		`;
+		authPanel.hidden = true;
+		authPanel.innerHTML = "";
+		uniqueCodeFooter.hidden = false;
+		uniqueCodeFooter.innerHTML = `
+			<div class="auth-note auth-note-success unique-code-card">
+				<p class="auth-note-title">User Unique Code</p>
+				<p class="auth-note-text">Use this value for the <strong>User-Unique-Code</strong> header when calling <strong>/api/record-attendance</strong>.</p>
+				<div class="auth-code-row">
+					<input id="user-unique-code" class="auth-input auth-code-input" type="${uniqueCodeVisible ? "text" : "password"}" readonly value="${escapeHtml(currentUser.uniqueCode)}" aria-label="User unique code" />
+					<button type="button" class="auth-button auth-copy-button" data-auth-action="copy-unique-code">Copy</button>
+					<button type="button" class="auth-button auth-eye-button" data-auth-action="toggle-unique-code-visibility" aria-label="${uniqueCodeVisible ? "Hide unique code" : "Show unique code"}">${uniqueCodeVisible ? "🙈" : "👁"}</button>
+				</div>
+			</div>
+		`;
+		forgotPasswordResult = null;
+		forgotPasswordDraft = null;
+		setStatsLocked(false);
+		return;
+	}
+
+	greetingElement.textContent = "You are not logged in";
+	actionBar.innerHTML = "";
+	authPanel.hidden = false;
+	uniqueCodeVisible = false;
+	uniqueCodeFooter.hidden = true;
+	uniqueCodeFooter.innerHTML = "";
+
+	const authHeading = authViewMode === "register" ? "Register" : "Login";
+	const usernameInputId = `${authViewMode}-username`;
+	const passwordInputId = `${authViewMode}-password`;
+	const submitLabel = authHeading;
+
+	authPanel.innerHTML = `
+		<div class="auth-tab-row">
+			<button type="button" class="auth-button auth-tab-button ${authViewMode === "login" ? "auth-tab-button-active" : ""}" data-auth-action="show-login">Login</button>
+			<button type="button" class="auth-button auth-tab-button ${authViewMode === "register" ? "auth-tab-button-active" : ""}" data-auth-action="show-register">Register</button>
+		</div>
+		<form id="auth-form" class="auth-form auth-form-single" autocomplete="on">
+			<h2 class="auth-form-title">${authHeading}</h2>
+			<label class="auth-label" for="${usernameInputId}">Username</label>
+			<input class="auth-input" id="${usernameInputId}" name="username" type="text" required />
+			<label class="auth-label" for="${passwordInputId}">Password</label>
+			<input class="auth-input" id="${passwordInputId}" name="password" type="password" required />
+			<button class="auth-button auth-button-primary" type="submit">${submitLabel}</button>
+			<button class="auth-button auth-button-secondary" type="button" data-auth-action="forgot-password">Forget password</button>
+		</form>
+		${
+			forgotPasswordDraft
+				? `<form id="forgot-password-form" class="auth-form auth-form-single auth-forgot-form" autocomplete="off">
+					<h3 class="auth-form-title">Generate Manual Reset Hash</h3>
+					<label class="auth-label" for="forgot-username">Username</label>
+					<input class="auth-input" id="forgot-username" name="username" type="text" value="${escapeHtml(forgotPasswordDraft.username)}" required />
+					<label class="auth-label" for="forgot-new-password">New password</label>
+					<input class="auth-input" id="forgot-new-password" name="newPassword" type="password" required />
+					<div class="auth-inline-actions">
+						<button class="auth-button auth-button-primary" type="submit">Generate hash</button>
+						<button class="auth-button" type="button" data-auth-action="cancel-forgot-password">Cancel</button>
+					</div>
+				</form>`
+				: ""
+		}
+		${
+			forgotPasswordResult
+				? `<div class="auth-note auth-note-warning">
+					<p class="auth-note-title">Manual Reset Hash Ready</p>
+					<p class="auth-note-text"><strong>Username:</strong> ${escapeHtml(forgotPasswordResult.username)}</p>
+					<div class="auth-code-row">
+						<input id="forgot-password-hash" class="auth-input auth-code-input" type="text" readonly value="${escapeHtml(forgotPasswordResult.passwordHash)}" aria-label="Generated password hash" />
+						<button type="button" class="auth-button auth-copy-button" data-auth-action="copy-forgot-hash">Copy</button>
+					</div>
+					<p class="auth-note-text auth-note-warning-text">Send this username and hash to <strong>Khanh Luong</strong> for manual password reset.</p>
+				</div>`
+				: ""
+		}
+		${authPanelMessage ? `<p class="auth-inline-message">${escapeHtml(authPanelMessage)}</p>` : ""}
+	`;
+	setStatsLocked(true);
+}
+
+async function fetchJsonOrThrow(url, options = {}) {
+	const response = await fetch(url, options);
+	let payload = null;
+
+	try {
+		payload = await response.json();
+	} catch {
+		payload = null;
+	}
+
+	if (!response.ok) {
+		const errorMessage =
+			payload?.error || payload?.details || `HTTP ${response.status}`;
+		throw new Error(errorMessage);
+	}
+
+	return payload;
+}
+
+async function syncAuthState() {
+	const authState = await fetchJsonOrThrow("/api/auth/me");
+	if (authState?.authenticated && authState.user) {
+		currentUser = authState.user;
+	} else {
+		currentUser = null;
+	}
+
+	renderAuthUi();
+}
 
 async function loadStats() {
 	const statsGrid = document.getElementById("stats-grid");
+	if (!statsGrid) {
+		return;
+	}
+
+	if (!currentUser) {
+		statsGrid.innerHTML = `
+			<article class="stat-card stat-card-primary">
+				<p class="stat-label">Stats Locked</p>
+				<p class="stat-value">Login Required</p>
+				<p class="stat-description">Authenticate to view your personalized attendance metrics.</p>
+			</article>
+		`;
+		return;
+	}
 
 	try {
 		const response = await fetch("/api/stats");
 		if (!response.ok) {
+			if (response.status === 401) {
+				currentUser = null;
+				authPanelMessage = "Session expired. Please login again.";
+				renderAuthUi();
+				loadStats();
+				return;
+			}
+
 			throw new Error(`HTTP ${response.status}`);
 		}
 
@@ -279,6 +453,10 @@ function renderStats(target, payload) {
 }
 
 async function recalculatePreviewStats(attendedDateStrings) {
+	if (!currentUser) {
+		throw new Error("Authentication required");
+	}
+
 	const response = await fetch("/api/stats/preview", {
 		method: "POST",
 		headers: {
@@ -336,6 +514,9 @@ async function handleAttendanceToggleCell(calendarCell) {
 
 function registerCalendarInteractions() {
 	const statsGrid = document.getElementById("stats-grid");
+	if (!statsGrid) {
+		return;
+	}
 
 	function changeViewedMonth(monthOffset) {
 		if (!latestStatsPayload || !viewedMonthDateString) {
@@ -392,5 +573,232 @@ function registerCalendarInteractions() {
 	});
 }
 
-registerCalendarInteractions();
-loadStats();
+function registerAuthInteractions() {
+	const authPanel = document.getElementById("auth-panel");
+	const actionBar = document.getElementById("auth-action-bar");
+	const uniqueCodeFooter = document.getElementById("unique-code-footer");
+
+	if (!authPanel || !actionBar || !uniqueCodeFooter) {
+		return;
+	}
+
+	actionBar.addEventListener("click", async (event) => {
+		if (!(event.target instanceof Element)) {
+			return;
+		}
+
+		const button = event.target.closest("button[data-auth-action]");
+		if (!button) {
+			return;
+		}
+
+		const action = button.getAttribute("data-auth-action");
+		if (action !== "logout") {
+			return;
+		}
+
+		try {
+			await fetchJsonOrThrow("/api/auth/logout", { method: "POST" });
+			currentUser = null;
+			uniqueCodeVisible = false;
+			authPanelMessage = "Logged out successfully.";
+			baselineAttendedDateSet = new Set();
+			workingAttendedDateSet = new Set();
+			latestStatsPayload = null;
+			renderAuthUi();
+			loadStats();
+		} catch (error) {
+			authPanelMessage = `Logout failed: ${error.message}`;
+			renderAuthUi();
+		}
+	});
+
+	authPanel.addEventListener("click", async (event) => {
+		if (!(event.target instanceof Element)) {
+			return;
+		}
+
+		const button = event.target.closest("button[data-auth-action]");
+		if (!button) {
+			return;
+		}
+
+		const action = button.getAttribute("data-auth-action");
+		if (action === "show-register" || action === "show-login") {
+			authViewMode = action === "show-register" ? "register" : "login";
+			authPanelMessage = "";
+			forgotPasswordResult = null;
+			renderAuthUi();
+			document.getElementById(`${authViewMode}-username`)?.focus();
+			return;
+		}
+
+		if (action === "forgot-password") {
+			const fallbackUsernameInput = document.getElementById(
+				`${authViewMode}-username`,
+			);
+			const initialUsername =
+				fallbackUsernameInput instanceof HTMLInputElement
+					? fallbackUsernameInput.value.trim()
+					: "";
+			forgotPasswordDraft = { username: initialUsername };
+			authPanelMessage = "";
+			renderAuthUi();
+			document.getElementById("forgot-new-password")?.focus();
+			return;
+		}
+
+		if (action === "cancel-forgot-password") {
+			forgotPasswordDraft = null;
+			renderAuthUi();
+			return;
+		}
+
+		if (action === "copy-forgot-hash") {
+			if (!forgotPasswordResult) {
+				return;
+			}
+
+			try {
+				const textToCopy = `Username: ${forgotPasswordResult.username}\nPassword hash: ${forgotPasswordResult.passwordHash}`;
+				await navigator.clipboard.writeText(textToCopy);
+				authPanelMessage = "Reset hash copied to clipboard.";
+			} catch {
+				authPanelMessage =
+					"Unable to copy automatically. Please copy manually.";
+			}
+
+			renderAuthUi();
+		}
+	});
+
+	uniqueCodeFooter.addEventListener("click", async (event) => {
+		if (!(event.target instanceof Element)) {
+			return;
+		}
+
+		const button = event.target.closest("button[data-auth-action]");
+		if (!button) {
+			return;
+		}
+
+		const action = button.getAttribute("data-auth-action");
+		if (action === "copy-unique-code") {
+			const codeInput = document.getElementById("user-unique-code");
+			if (!(codeInput instanceof HTMLInputElement)) {
+				return;
+			}
+
+			try {
+				await navigator.clipboard.writeText(codeInput.value);
+				authPanelMessage = "Unique code copied to clipboard.";
+			} catch {
+				authPanelMessage =
+					"Unable to copy automatically. Please copy manually.";
+			}
+
+			renderAuthUi();
+			return;
+		}
+
+		if (action === "toggle-unique-code-visibility") {
+			uniqueCodeVisible = !uniqueCodeVisible;
+			renderAuthUi();
+		}
+	});
+
+	authPanel.addEventListener("submit", async (event) => {
+		event.preventDefault();
+
+		if (!(event.target instanceof HTMLFormElement)) {
+			return;
+		}
+
+		if (event.target.id === "forgot-password-form") {
+			const forgotFormData = new FormData(event.target);
+			const username = `${forgotFormData.get("username") ?? ""}`.trim();
+			const newPassword = `${forgotFormData.get("newPassword") ?? ""}`;
+
+			if (!username || !newPassword) {
+				authPanelMessage = "Username and new password are required.";
+				renderAuthUi();
+				return;
+			}
+
+			try {
+				const result = await fetchJsonOrThrow(
+					"/api/auth/forgot-password-hash",
+					{
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify({ username, newPassword }),
+					},
+				);
+
+				forgotPasswordResult = result;
+				forgotPasswordDraft = null;
+				authPanelMessage = "Hash generated. Share it with Khanh Luong.";
+			} catch (error) {
+				forgotPasswordResult = null;
+				authPanelMessage = `Failed to generate hash: ${error.message}`;
+			}
+
+			renderAuthUi();
+			return;
+		}
+
+		const formData = new FormData(event.target);
+		const username = `${formData.get("username") ?? ""}`.trim();
+		const password = `${formData.get("password") ?? ""}`;
+
+		if (!username || !password) {
+			authPanelMessage = "Username and password are required.";
+			renderAuthUi();
+			return;
+		}
+
+		const endpoint =
+			authViewMode === "register" ? "/api/auth/register" : "/api/auth/login";
+
+		try {
+			const authResponse = await fetchJsonOrThrow(endpoint, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ username, password }),
+			});
+
+			currentUser = authResponse.user;
+			authPanelMessage = "";
+			baselineAttendedDateSet = new Set();
+			workingAttendedDateSet = new Set();
+			latestStatsPayload = null;
+			viewedMonthDateString = null;
+			renderAuthUi();
+			loadStats();
+		} catch (error) {
+			authPanelMessage = `Authentication failed: ${error.message}`;
+			renderAuthUi();
+		}
+	});
+}
+
+async function initializeApp() {
+	registerCalendarInteractions();
+	registerAuthInteractions();
+
+	try {
+		await syncAuthState();
+	} catch {
+		currentUser = null;
+		authPanelMessage = "Unable to check auth state. Try refreshing.";
+		renderAuthUi();
+	}
+
+	await loadStats();
+}
+
+initializeApp();

@@ -1,139 +1,79 @@
 require("dotenv").config({ quiet: true });
 const express = require("express");
 const path = require("node:path");
-const { db } = require("./db/client");
-const { attendanceRecords } = require("./db/schema");
-const {
-	getBeltStats,
-	getBeltStatsFromAttendedDateStrings,
-} = require("./services/beltStats");
 
 const app = express();
 const port = process.env.PORT || 3000;
 
+const workerModulePromise = import("./worker.mjs");
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "..", "public")));
 
-function getUtcPlus7DateString(now = new Date()) {
-	const localTimeInUtcPlus7 = new Date(now.getTime() + 7 * 60 * 60 * 1000);
-	return localTimeInUtcPlus7.toISOString().slice(0, 10);
-}
-
-function isValidIsoDate(dateString) {
-	if (typeof dateString !== "string") {
-		return false;
-	}
-
-	if (!/^\d{4}-\d{2}-\d{2}$/.test(dateString)) {
-		return false;
-	}
-
-	const parsed = new Date(`${dateString}T00:00:00.000Z`);
-	if (Number.isNaN(parsed.getTime())) {
-		return false;
-	}
-
-	return parsed.toISOString().slice(0, 10) === dateString;
-}
-
-app.post("/api/record-attendance", async (_req, res) => {
-	try {
-		const attendanceDate = getUtcPlus7DateString();
-
-		const result = await db
-			.insert(attendanceRecords)
-			.values({ date: attendanceDate })
-			.onConflictDoNothing({ target: attendanceRecords.date })
-			.returning({ insertedDate: attendanceRecords.date });
-
-		const created = result.length > 0;
-
-		res.json({
-			created,
-			date: attendanceDate,
-			message: created
-				? "Attendance recorded"
-				: "Attendance already exists for this UTC+7 date",
-		});
-	} catch (error) {
-		res.status(500).json({
-			error: "Failed to record attendance",
-			details: error.message,
-		});
-	}
-});
-
-app.post("/api/stats/preview", async (req, res) => {
-	try {
-		const requestedDates = req.body?.attendedDateStrings;
-		if (!Array.isArray(requestedDates)) {
-			res.status(400).json({
-				error: "Invalid attendedDateStrings",
-				details: "Provide an array of ISO dates (YYYY-MM-DD)",
-			});
-			return;
-		}
-
-		const invalidDate = requestedDates.find(
-			(dateString) => !isValidIsoDate(dateString),
-		);
-		if (invalidDate) {
-			res.status(400).json({
-				error: "Invalid date",
-				details: `Invalid ISO date: ${invalidDate}`,
-			});
-			return;
-		}
-
-		const stats = getBeltStatsFromAttendedDateStrings(requestedDates);
-
-		res.json(stats);
-	} catch (error) {
-		res.status(500).json({
-			error: "Failed to compute preview stats",
-			details: error.message,
-		});
-	}
-});
-
-app.get("/api/stats", async (_req, res) => {
-	try {
-		const stats = await getBeltStats(db);
-
-		res.json({
-			_docs: {
-				recordAttendance:
-					"POST /api/record-attendance records today's date using UTC+7 timezone. Idempotent: repeated calls for the same UTC+7 day do not create duplicates.",
-				previewStats:
-					"POST /api/stats/preview accepts attendedDateStrings (array of YYYY-MM-DD) and returns recomputed BELT stats without writing to database.",
-				currentBeltStat:
-					"Average attended weekdays across the best 8 weeks within the trailing 12-week window. Compare this value against 3.0.",
-				sumBestEight:
-					"Sum of attended weekdays from the selected best 8 weeks used to compute currentBeltStat (average = sumBestEight / 8).",
-				currentMonthAttendance:
-					"Number of attended weekdays recorded in the current calendar month up to today.",
-				currentMonthAttendanceDates:
-					"ISO date list (YYYY-MM-DD) of attended dates in the current month. Intended for calendar highlighting and click-to-toggle UI state.",
-				currentDate:
-					"Current date in ISO format (YYYY-MM-DD) using UTC+7 day boundary used by backend while computing stats.",
-				bestEightBreakdown:
-					"Sorted counts selected as the best 8 weeks from the trailing 12-week window (used to compute sumBestEight).",
-				trailingTwelveBreakdown:
-					"Week-by-week attendance counts for the trailing 12-week window where index 0 is the current week.",
-				wfhStartDateIfTodayAttended:
-					"Date where max consecutive WFH counting starts when today is marked attended (tomorrow in UTC+0 date space, shifted to next weekday).",
-				wfhStartDateIfTodayNotAttended:
-					"Date where max consecutive WFH counting starts when today is not attended (today in UTC+0 date space, shifted to next weekday).",
-				maximumConsecutiveWfhDays:
-					"Maximum number of consecutive weekday WFH days from today that still keeps BELT compliant.",
-				nextDayAttendanceStatChange:
-					"Delta in maximumConsecutiveWfhDays when today is attended vs not attended. Positive means attending today increases allowed future consecutive WFH days.",
+function createWorkerEnv() {
+	return {
+		TURSO_DATABASE_URL: process.env.TURSO_DATABASE_URL,
+		TURSO_AUTH_TOKEN: process.env.TURSO_AUTH_TOKEN,
+		PASSWORD_HASH_SECRET: process.env.PASSWORD_HASH_SECRET,
+		ASSETS: {
+			fetch() {
+				return new Response("Not Found", { status: 404 });
 			},
-			...stats,
+		},
+	};
+}
+
+app.use("/api", async (req, res) => {
+	try {
+		const workerModule = await workerModulePromise;
+		const worker = workerModule.default;
+		if (!worker || typeof worker.fetch !== "function") {
+			res.status(500).json({ error: "Worker module fetch handler missing" });
+			return;
+		}
+
+		const requestUrl = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+		const headers = new Headers();
+		for (const [key, value] of Object.entries(req.headers)) {
+			if (Array.isArray(value)) {
+				for (const item of value) {
+					headers.append(key, item);
+				}
+				continue;
+			}
+
+			if (value !== undefined) {
+				headers.set(key, String(value));
+			}
+		}
+
+		let body;
+		if (req.method !== "GET" && req.method !== "HEAD") {
+			body = JSON.stringify(req.body ?? {});
+			headers.set("content-type", "application/json");
+		}
+
+		const request = new Request(requestUrl, {
+			method: req.method,
+			headers,
+			body,
 		});
+
+		const response = await worker.fetch(request, createWorkerEnv());
+		res.status(response.status);
+
+		response.headers.forEach((value, key) => {
+			if (key.toLowerCase() === "content-length") {
+				return;
+			}
+			res.setHeader(key, value);
+		});
+
+		const responseBody = await response.text();
+		res.send(responseBody);
 	} catch (error) {
 		res.status(500).json({
-			error: "Failed to compute BELT stats",
+			error: "Failed to route request through worker handler",
 			details: error.message,
 		});
 	}
