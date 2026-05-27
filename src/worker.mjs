@@ -11,6 +11,8 @@ const UNIQUE_CODE_LENGTH = 8;
 const UNIQUE_CODE_CHARSET =
 	"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const BCRYPT_SALT_ROUNDS = 10;
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
 
 let cachedDb = null;
 let cachedCredentialsKey = null;
@@ -117,6 +119,7 @@ async function getSessionFromRequest(request, env) {
 			id: sessions.sessionId,
 			userId: sessions.userId,
 			username: users.username,
+			createdAt: sessions.createdAt,
 		})
 		.from(sessions)
 		.innerJoin(users, eq(users.id, sessions.userId))
@@ -127,6 +130,17 @@ async function getSessionFromRequest(request, env) {
 	if (!session) {
 		return null;
 	}
+
+	const now = Date.now();
+	if (now - session.createdAt > SESSION_TTL_MS) {
+		await db.delete(sessions).where(eq(sessions.sessionId, session.id));
+		return null;
+	}
+
+	await db
+		.update(sessions)
+		.set({ createdAt: now })
+		.where(eq(sessions.sessionId, session.id));
 
 	return session;
 }
@@ -141,7 +155,7 @@ function withSessionCookie(data, sessionId, status = 200) {
 		status,
 		headers: {
 			"Content-Type": "application/json",
-			"Set-Cookie": `${SESSION_COOKIE_NAME}=${encodeURIComponent(sessionId)}; Path=/; HttpOnly; SameSite=Lax`,
+			"Set-Cookie": `${SESSION_COOKIE_NAME}=${encodeURIComponent(sessionId)}; Path=/; Max-Age=${SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax`,
 		},
 	});
 }
@@ -546,7 +560,10 @@ async function handleAuthMe(request, env) {
 			return withClearedSessionCookie(buildAuthResponse(null));
 		}
 
-		return json(buildAuthResponse(session, matchedUser));
+		return withSessionCookie(
+			buildAuthResponse(session, matchedUser),
+			session.id,
+		);
 	} catch (error) {
 		return json(
 			{
@@ -666,15 +683,18 @@ async function handleStats(request, env) {
 
 		const db = getDbForEnv(env);
 		const stats = await getBeltStats(db, session.userId);
-		return json({
-			_docs: API_DOCS,
-			auth: {
-				authenticated: true,
-				userId: session.userId,
-				username: session.username,
+		return json(
+			{
+				_docs: API_DOCS,
+				auth: {
+					authenticated: true,
+					userId: session.userId,
+					username: session.username,
+				},
+				...stats,
 			},
-			...stats,
-		});
+			session.id,
+		);
 	} catch (error) {
 		return json(
 			{
