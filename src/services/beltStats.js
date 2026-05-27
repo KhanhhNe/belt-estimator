@@ -1,10 +1,11 @@
-const { asc, eq } = require("drizzle-orm");
+const { and, asc, eq, gte } = require("drizzle-orm");
 const { attendanceRecords } = require("../db/schema");
 
 const TOTAL_WEEKS = 12;
 const BEST_WEEKS_COUNT = 8;
 const COMPLIANCE_THRESHOLD = 3;
 const MAX_SIMULATION_DAYS = 365;
+const FETCH_WEEKS = TOTAL_WEEKS + 1;
 
 function parseIsoDate(dateString) {
 	const [year, month, day] = dateString.split("-").map(Number);
@@ -48,6 +49,12 @@ function startOfWeekMonday(date) {
 	const dayOffset = (start.getUTCDay() + 6) % 7;
 	start.setUTCDate(start.getUTCDate() - dayOffset);
 	return start;
+}
+
+function getFetchWindowStartDate(now) {
+	const today = utcPlus7DateOnly(now);
+	const currentWeekStart = startOfWeekMonday(today);
+	return addDays(currentWeekStart, -(FETCH_WEEKS - 1) * 7);
 }
 
 function getWeeklyAttendanceCounts(attendedDates, asOfDate) {
@@ -199,11 +206,18 @@ function computeMaximumConsecutiveWfhDays({
 	return maxAllowed;
 }
 
-async function fetchAttendedDateStrings(db, userId) {
+async function fetchAttendedDateStrings(db, userId, now = new Date()) {
+	const windowStartDate = formatIsoDate(getFetchWindowStartDate(now));
+
 	const rows = await db
 		.selectDistinct({ date: attendanceRecords.date })
 		.from(attendanceRecords)
-		.where(eq(attendanceRecords.userId, userId))
+		.where(
+			and(
+				eq(attendanceRecords.userId, userId),
+				gte(attendanceRecords.date, windowStartDate),
+			),
+		)
 		.orderBy(asc(attendanceRecords.date));
 
 	return rows.map((row) => row.date);
@@ -299,7 +313,7 @@ function getBeltStatsFromAttendedDateStrings(
 }
 
 async function getBeltStats(db, userId, now = new Date()) {
-	const attendedDateStrings = await fetchAttendedDateStrings(db, userId);
+	const attendedDateStrings = await fetchAttendedDateStrings(db, userId, now);
 	return getBeltStatsFromAttendedDateStrings(attendedDateStrings, now);
 }
 
