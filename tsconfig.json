@@ -16,6 +16,8 @@
 	},
 	"include": [
 		"src/**/*.js",
+		"src/**/*.mjs",
+		"src/**/*.d.ts",
 		"scripts/**/*.js",
 		"public/**/*.js",
 		"drizzle.config.js"

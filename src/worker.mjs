@@ -1,7 +1,10 @@
+import { httpServerHandler } from "cloudflare:node";
+import { env } from "cloudflare:workers";
 import { createClient } from "@libsql/client/web";
 import bcrypt from "bcryptjs";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/libsql";
+import express from "express";
 import schema from "./db/schema.js";
 import beltStats from "./services/beltStats.js";
 
@@ -34,6 +37,123 @@ const API_DOCS = {
 	stats:
 		"GET /api/stats requires an authenticated session and returns stats for the current session user.",
 };
+
+const app = express();
+app.use(express.json());
+
+function redactRequestBody(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return value;
+	}
+
+	const redacted = {};
+	for (const [key, nestedValue] of Object.entries(value)) {
+		if (
+			key.toLowerCase().includes("password") ||
+			key.toLowerCase().includes("hash")
+		) {
+			redacted[key] = "[FILTERED]";
+			continue;
+		}
+
+		redacted[key] = nestedValue;
+	}
+
+	return redacted;
+}
+
+app.use("/api", (req, res, next) => {
+	const startedAt = Date.now();
+	const startedIso = new Date(startedAt).toISOString();
+	const remoteIp =
+		req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() ||
+		req.socket.remoteAddress ||
+		req.ip;
+	const format = req.is("application/json") ? "JSON" : "HTML";
+	const safeParams = redactRequestBody(req.body ?? {});
+
+	console.log(
+		`Started ${req.method} "${req.originalUrl}" for ${remoteIp} at ${startedIso}`,
+	);
+	console.log(`Processing by Worker as ${format}`);
+	if (Object.keys(safeParams).length > 0) {
+		console.log(`Parameters: ${JSON.stringify(safeParams)}`);
+	}
+
+	res.on("finish", () => {
+		const durationMs = Date.now() - startedAt;
+		const statusCode = res.statusCode;
+		const responseLength = res.getHeader("content-length") ?? "unknown";
+		console.log(
+			`Completed ${statusCode} in ${durationMs}ms (Bytes: ${responseLength})`,
+		);
+	});
+
+	next();
+});
+
+function getExpressRequestUrl(req) {
+	const host = req.headers.host ?? "localhost";
+	return new URL(req.originalUrl, `https://${host}`).toString();
+}
+
+function createWorkerRequestFromExpress(req) {
+	const headers = new Headers();
+	for (const [key, value] of Object.entries(req.headers)) {
+		if (Array.isArray(value)) {
+			for (const item of value) {
+				headers.append(key, item);
+			}
+			continue;
+		}
+
+		if (value !== undefined) {
+			headers.set(key, String(value));
+		}
+	}
+
+	let body;
+	if (req.method !== "GET" && req.method !== "HEAD") {
+		body = JSON.stringify(req.body ?? {});
+		if (!headers.has("content-type")) {
+			headers.set("content-type", "application/json");
+		}
+	}
+
+	return new Request(getExpressRequestUrl(req), {
+		method: req.method,
+		headers,
+		body,
+	});
+}
+
+async function sendWorkerResponseToExpress(res, response) {
+	res.status(response.status);
+
+	response.headers.forEach((value, key) => {
+		if (key.toLowerCase() === "content-length") {
+			return;
+		}
+		res.setHeader(key, value);
+	});
+
+	res.send(await response.text());
+}
+
+function routeHandler(handler) {
+	return async (req, res) => {
+		try {
+			const request = createWorkerRequestFromExpress(req);
+			const response = await handler(request);
+			await sendWorkerResponseToExpress(res, response);
+		} catch (error) {
+			res.status(500).json({
+				error: "Unhandled worker route error",
+				details: error?.message,
+			});
+		}
+	};
+}
 
 function getUtcPlus7DateString(now = new Date()) {
 	const localTimeInUtcPlus7 = new Date(now.getTime() + 7 * 60 * 60 * 1000);
@@ -274,10 +394,9 @@ function getDbForEnv(env) {
 }
 
 async function handleRecordAttendance(env, request) {
-	const requestId = request.headers.get("x-request-id") ?? crypto.randomUUID();
 	const requestStartedAt = Date.now();
 	const requestUrl = new URL(request.url);
-	const logPrefix = `[record-attendance][${requestId}]`;
+	const logPrefix = "[record-attendance]";
 
 	try {
 		const attendanceDate = getUtcPlus7DateString();
@@ -693,7 +812,7 @@ async function handleStats(request, env) {
 				},
 				...stats,
 			},
-			session.id,
+			200,
 		);
 	} catch (error) {
 		return json(
@@ -705,49 +824,47 @@ async function handleStats(request, env) {
 		);
 	}
 }
+app.get("/", (_req, res) => {
+	res.json({ message: "Express.js running on Cloudflare Workers!" });
+});
 
-export default {
-	async fetch(request, env) {
-		const url = new URL(request.url);
+app.post(
+	"/api/auth/register",
+	routeHandler((request) => handleRegister(request, env)),
+);
+app.post(
+	"/api/auth/login",
+	routeHandler((request) => handleLogin(request, env)),
+);
+app.post(
+	"/api/auth/logout",
+	routeHandler((request) => handleLogout(request, env)),
+);
+app.get(
+	"/api/auth/me",
+	routeHandler((request) => handleAuthMe(request, env)),
+);
+app.post(
+	"/api/auth/forgot-password-hash",
+	routeHandler((request) => handleForgotPasswordHash(request, env)),
+);
+app.post(
+	"/api/record-attendance",
+	routeHandler((request) => handleRecordAttendance(env, request)),
+);
+app.post(
+	"/api/stats/preview",
+	routeHandler((request) => handlePreviewStats(request)),
+);
+app.get(
+	"/api/stats",
+	routeHandler((request) => handleStats(request, env)),
+);
 
-		if (request.method === "POST" && url.pathname === "/api/auth/register") {
-			return handleRegister(request, env);
-		}
+app.use("/api", (_req, res) => {
+	res.status(404).json({ error: "Not Found" });
+});
 
-		if (request.method === "POST" && url.pathname === "/api/auth/login") {
-			return handleLogin(request, env);
-		}
+app.listen(3000);
 
-		if (request.method === "POST" && url.pathname === "/api/auth/logout") {
-			return handleLogout(request, env);
-		}
-
-		if (request.method === "GET" && url.pathname === "/api/auth/me") {
-			return handleAuthMe(request, env);
-		}
-
-		if (
-			request.method === "POST" &&
-			url.pathname === "/api/auth/forgot-password-hash"
-		) {
-			return handleForgotPasswordHash(request, env);
-		}
-
-		if (
-			request.method === "POST" &&
-			url.pathname === "/api/record-attendance"
-		) {
-			return handleRecordAttendance(env, request);
-		}
-
-		if (request.method === "POST" && url.pathname === "/api/stats/preview") {
-			return handlePreviewStats(request);
-		}
-
-		if (request.method === "GET" && url.pathname === "/api/stats") {
-			return handleStats(request, env);
-		}
-
-		return env.ASSETS.fetch(request);
-	},
-};
+export default httpServerHandler({ port: 3000 });
