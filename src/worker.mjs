@@ -155,6 +155,48 @@ function sendUnhandledRouteError(res, error) {
 	});
 }
 
+function attachWorkerRequest(req, _res, next) {
+	req.workerRequest = createWorkerRequestFromExpress(req);
+	next();
+}
+
+function runWorkerHandler(workerHandler) {
+	return async (req, res, next) => {
+		try {
+			const response = await workerHandler(req, res);
+			if (response) {
+				res.locals.workerResponse = response;
+			}
+			next();
+		} catch (error) {
+			next(error);
+		}
+	};
+}
+
+async function sendWorkerResponseMiddleware(req, res, next) {
+	try {
+		const response = res.locals.workerResponse;
+		if (!response) {
+			next();
+			return;
+		}
+
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		next(error);
+	}
+}
+
+function handleApiRouteError(error, _req, res, _next) {
+	if (res.headersSent) {
+		return;
+	}
+
+	sendUnhandledRouteError(res, error);
+}
+
 async function logWorkerErrorResponseIfNeeded(req, response) {
 	if (!response || response.status < 400) {
 		return;
@@ -479,12 +521,388 @@ function getDbForEnv(env) {
 	return cachedDb;
 }
 
-async function handleRecordAttendance(env, request) {
-	const requestStartedAt = Date.now();
-	const requestUrl = new URL(request.url);
-	const logPrefix = "[record-attendance]";
+function parseAttendanceMonth(monthToken) {
+	const value = `${monthToken ?? ""}`.trim();
+	const shortMatch = value.match(/^(\d{2})\/(\d{2})$/);
+	if (shortMatch) {
+		const month = Number(shortMatch[1]);
+		const year = 2000 + Number(shortMatch[2]);
+		if (month >= 1 && month <= 12) {
+			return { year, month };
+		}
+	}
 
-	try {
+	const longMatch = value.match(/^(\d{2})\/(\d{4})$/);
+	if (longMatch) {
+		const month = Number(longMatch[1]);
+		const year = Number(longMatch[2]);
+		if (month >= 1 && month <= 12) {
+			return { year, month };
+		}
+	}
+
+	return null;
+}
+
+function formatMonthRangeBoundary(year, month) {
+	return `${year.toString().padStart(4, "0")}-${month.toString().padStart(2, "0")}-01`;
+}
+app.get("/", (_req, res) => {
+	res.json({ message: "Express.js running on Cloudflare Workers!" });
+});
+
+app.use("/api", attachWorkerRequest);
+
+app.post(
+	"/api/auth/register",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const body = await request.json();
+		const username = `${body?.username ?? ""}`.trim();
+		const password = `${body?.password ?? ""}`;
+
+		if (!username || !password) {
+			return errorJson(
+				"auth-register",
+				400,
+				"Invalid payload",
+				"username and password are required",
+			);
+		}
+
+		const db = getDbForEnv(env);
+		const existingUsers = await db
+			.select({ id: users.id })
+			.from(users)
+			.where(eq(users.username, username))
+			.limit(1);
+
+		if (existingUsers.length > 0) {
+			return errorJson(
+				"auth-register",
+				409,
+				"Username already exists",
+				"Choose another username",
+				{ username },
+			);
+		}
+
+		const uniqueCode = await generateUniqueCode(db);
+		const passwordHash = await hashPassword(password, env);
+		const insertedUsers = await db
+			.insert(users)
+			.values({ username, password: passwordHash, uniqueCode })
+			.returning({
+				id: users.id,
+				username: users.username,
+				uniqueCode: users.uniqueCode,
+				isAdmin: users.isAdmin,
+			});
+
+		const insertedUser = insertedUsers[0];
+		const sessionId = await createSessionForUser(insertedUser, db);
+		return withSessionCookie(
+			{
+				message: "Registered successfully",
+				...buildAuthResponse(
+					{ userId: insertedUser.id, username: insertedUser.username },
+					insertedUser,
+				),
+			},
+			sessionId,
+			201,
+		);
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.post(
+	"/api/auth/login",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const body = await request.json();
+		const username = `${body?.username ?? ""}`.trim();
+		const password = `${body?.password ?? ""}`;
+
+		if (!username || !password) {
+			return errorJson(
+				"auth-login",
+				400,
+				"Invalid payload",
+				"username and password are required",
+			);
+		}
+
+		const db = getDbForEnv(env);
+		const matchedUsers = await db
+			.select({
+				id: users.id,
+				username: users.username,
+				password: users.password,
+				uniqueCode: users.uniqueCode,
+				isAdmin: users.isAdmin,
+			})
+			.from(users)
+			.where(eq(users.username, username))
+			.limit(1);
+
+		const matchedUser = matchedUsers[0];
+		if (!matchedUser) {
+			return errorJson(
+				"auth-login",
+				401,
+				"Invalid credentials",
+				"Incorrect username or password",
+				{ username },
+			);
+		}
+
+		const isPasswordValid = await verifyPassword(
+			password,
+			matchedUser.password,
+			env,
+		);
+		if (!isPasswordValid) {
+			return errorJson(
+				"auth-login",
+				401,
+				"Invalid credentials",
+				"Incorrect username or password",
+				{ username },
+			);
+		}
+
+		const sessionId = await createSessionForUser(matchedUser, db);
+		return withSessionCookie(
+			{
+				message: "Logged in successfully",
+				...buildAuthResponse(
+					{ userId: matchedUser.id, username: matchedUser.username },
+					matchedUser,
+				),
+			},
+			sessionId,
+		);
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.post(
+	"/api/auth/logout",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const session = await getSessionFromRequest(request, env);
+		if (session) {
+			await deleteSessionById(session.id, env);
+		}
+
+		return withClearedSessionCookie({
+			authenticated: false,
+			message: "Logged out",
+		});
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.get(
+	"/api/auth/me",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const authResult = await getAuthenticatedUserFromRequest(request, env);
+		if (authResult.errorResponse) {
+			if (authResult.errorResponse.status === 401) {
+				return json(buildAuthResponse(null));
+			}
+
+			return authResult.errorResponse;
+		}
+
+		const { session, user } = authResult;
+		return withSessionCookie(buildAuthResponse(session, user), session.id);
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.post(
+	"/api/auth/forgot-password-hash",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const body = await request.json();
+		const username = `${body?.username ?? ""}`.trim();
+		const newPassword = `${body?.newPassword ?? ""}`;
+
+		if (!username || !newPassword) {
+			return errorJson(
+				"forgot-password-hash",
+				400,
+				"Invalid payload",
+				"username and newPassword are required",
+			);
+		}
+
+		const db = getDbForEnv(env);
+		const matchedUsers = await db
+			.select({ id: users.id, username: users.username })
+			.from(users)
+			.where(eq(users.username, username))
+			.limit(1);
+
+		const matchedUser = matchedUsers[0];
+		if (!matchedUser) {
+			return errorJson(
+				"forgot-password-hash",
+				404,
+				"User not found",
+				"No user exists with the provided username",
+				{ username },
+			);
+		}
+
+		const passwordHash = await hashPassword(newPassword, env);
+		return json({
+			username: matchedUser.username,
+			passwordHash,
+			hint: "Send this username and password hash to Khanh Luong for manual password reset.",
+		});
+	}),
+	sendWorkerResponseMiddleware,
+);
+
+app.use(
+	"/api/admin",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const authResult = await getAuthenticatedUserFromRequest(request, env);
+		if (authResult.errorResponse) {
+			return authResult.errorResponse;
+		}
+
+		if (!authResult.user.isAdmin) {
+			return errorJson(
+				"admin-authz",
+				403,
+				"Forbidden",
+				"Admin privileges required",
+				{ username: authResult.user.username },
+			);
+		}
+
+		return null;
+	}),
+	sendWorkerResponseMiddleware,
+);
+
+app.get(
+	"/api/admin/list-users",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const authResult = await getAuthenticatedUserFromRequest(request, env);
+		if (authResult.errorResponse) {
+			return authResult.errorResponse;
+		}
+
+		const { db, user } = authResult;
+		if (!user.isAdmin) {
+			return errorJson(
+				"admin-list-users",
+				403,
+				"Forbidden",
+				"Admin privileges required",
+				{ username: user.username },
+			);
+		}
+
+		const rows = await db
+			.select({
+				id: users.id,
+				username: users.username,
+				isAdmin: users.isAdmin,
+			})
+			.from(users)
+			.orderBy(asc(users.username));
+
+		return json({
+			users: rows.map((row) => ({
+				id: row.id,
+				username: row.username,
+				isAdmin: Boolean(row.isAdmin),
+			})),
+		});
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.post(
+	"/api/admin/impersonate",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const authResult = await getAuthenticatedUserFromRequest(request, env);
+		if (authResult.errorResponse) {
+			return authResult.errorResponse;
+		}
+
+		const { db, session, user } = authResult;
+		if (!user.isAdmin) {
+			return errorJson(
+				"admin-impersonate",
+				403,
+				"Forbidden",
+				"Admin privileges required",
+				{ username: user.username },
+			);
+		}
+
+		const body = await request.json();
+		const userId = Number(body?.userId);
+		if (!Number.isInteger(userId) || userId <= 0) {
+			return errorJson(
+				"admin-impersonate",
+				400,
+				"Invalid payload",
+				"userId must be a positive integer",
+			);
+		}
+
+		const matchedUsers = await db
+			.select({
+				id: users.id,
+				username: users.username,
+				uniqueCode: users.uniqueCode,
+				isAdmin: users.isAdmin,
+			})
+			.from(users)
+			.where(eq(users.id, userId))
+			.limit(1);
+
+		const targetUser = matchedUsers[0];
+		if (!targetUser) {
+			return errorJson(
+				"admin-impersonate",
+				404,
+				"User not found",
+				"The selected user does not exist",
+				{ requestedUserId: userId },
+			);
+		}
+
+		const newSessionId = await createSessionForUser(targetUser, db);
+		await deleteSessionById(session.id, env);
+
+		return withSessionCookie(
+			{
+				message: `Now logged in as ${targetUser.username}`,
+				...buildAuthResponse(
+					{ userId: targetUser.id, username: targetUser.username },
+					targetUser,
+				),
+			},
+			newSessionId,
+		);
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.post(
+	"/api/record-attendance",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const requestStartedAt = Date.now();
+		const requestUrl = new URL(request.url);
+		const logPrefix = "[record-attendance]";
 		const attendanceDate = getUtcPlus7DateString();
 		const db = getDbForEnv(env);
 		const userUniqueCode = request.headers.get("User-Unique-Code")?.trim();
@@ -563,281 +981,13 @@ async function handleRecordAttendance(env, request) {
 				? "Attendance recorded"
 				: "Attendance already exists for this UTC+7 date",
 		});
-	} catch (error) {
-		console.error(
-			`${logPrefix} Failed to record attendance`,
-			JSON.stringify({
-				durationMs: Date.now() - requestStartedAt,
-				errorMessage: error?.message,
-				stack: error?.stack,
-			}),
-		);
-		return errorJson(
-			"record-attendance",
-			500,
-			"Failed to record attendance",
-			error.message,
-		);
-	}
-}
-
-async function handleRegister(request, env) {
-	try {
-		const body = await request.json();
-		const username = `${body?.username ?? ""}`.trim();
-		const password = `${body?.password ?? ""}`;
-
-		if (!username || !password) {
-			return errorJson(
-				"auth-register",
-				400,
-				"Invalid payload",
-				"username and password are required",
-			);
-		}
-
-		const db = getDbForEnv(env);
-		const existingUsers = await db
-			.select({ id: users.id })
-			.from(users)
-			.where(eq(users.username, username))
-			.limit(1);
-
-		if (existingUsers.length > 0) {
-			return errorJson(
-				"auth-register",
-				409,
-				"Username already exists",
-				"Choose another username",
-				{ username },
-			);
-		}
-
-		const uniqueCode = await generateUniqueCode(db);
-		const passwordHash = await hashPassword(password, env);
-		const insertedUsers = await db
-			.insert(users)
-			.values({ username, password: passwordHash, uniqueCode })
-			.returning({
-				id: users.id,
-				username: users.username,
-				uniqueCode: users.uniqueCode,
-				isAdmin: users.isAdmin,
-			});
-
-		const insertedUser = insertedUsers[0];
-		const sessionId = await createSessionForUser(insertedUser, db);
-		return withSessionCookie(
-			{
-				message: "Registered successfully",
-				...buildAuthResponse(
-					{ userId: insertedUser.id, username: insertedUser.username },
-					insertedUser,
-				),
-			},
-			sessionId,
-			201,
-		);
-	} catch (error) {
-		return errorJson("auth-register", 500, "Failed to register", error.message);
-	}
-}
-
-async function handleLogin(request, env) {
-	try {
-		const body = await request.json();
-		const username = `${body?.username ?? ""}`.trim();
-		const password = `${body?.password ?? ""}`;
-
-		if (!username || !password) {
-			return errorJson(
-				"auth-login",
-				400,
-				"Invalid payload",
-				"username and password are required",
-			);
-		}
-
-		const db = getDbForEnv(env);
-		const matchedUsers = await db
-			.select({
-				id: users.id,
-				username: users.username,
-				password: users.password,
-				uniqueCode: users.uniqueCode,
-				isAdmin: users.isAdmin,
-			})
-			.from(users)
-			.where(eq(users.username, username))
-			.limit(1);
-
-		const matchedUser = matchedUsers[0];
-		if (!matchedUser) {
-			return errorJson(
-				"auth-login",
-				401,
-				"Invalid credentials",
-				"Incorrect username or password",
-				{ username },
-			);
-		}
-
-		const isPasswordValid = await verifyPassword(
-			password,
-			matchedUser.password,
-			env,
-		);
-		if (!isPasswordValid) {
-			return errorJson(
-				"auth-login",
-				401,
-				"Invalid credentials",
-				"Incorrect username or password",
-				{ username },
-			);
-		}
-
-		const sessionId = await createSessionForUser(matchedUser, db);
-		return withSessionCookie(
-			{
-				message: "Logged in successfully",
-				...buildAuthResponse(
-					{ userId: matchedUser.id, username: matchedUser.username },
-					matchedUser,
-				),
-			},
-			sessionId,
-		);
-	} catch (error) {
-		return errorJson("auth-login", 500, "Failed to login", error.message);
-	}
-}
-
-async function handleLogout(request, env) {
-	const session = await getSessionFromRequest(request, env);
-	if (session) {
-		await deleteSessionById(session.id, env);
-	}
-
-	return withClearedSessionCookie({
-		authenticated: false,
-		message: "Logged out",
-	});
-}
-
-async function handleAuthMe(request, env) {
-	try {
-		const authResult = await getAuthenticatedUserFromRequest(request, env);
-		if (authResult.errorResponse) {
-			if (authResult.errorResponse.status === 401) {
-				return json(buildAuthResponse(null));
-			}
-
-			return authResult.errorResponse;
-		}
-
-		const { session, user } = authResult;
-		return withSessionCookie(buildAuthResponse(session, user), session.id);
-	} catch (error) {
-		return errorJson(
-			"auth-me",
-			500,
-			"Failed to load auth state",
-			error.message,
-		);
-	}
-}
-
-async function handleForgotPasswordHash(request, env) {
-	try {
-		const body = await request.json();
-		const username = `${body?.username ?? ""}`.trim();
-		const newPassword = `${body?.newPassword ?? ""}`;
-
-		if (!username || !newPassword) {
-			return errorJson(
-				"forgot-password-hash",
-				400,
-				"Invalid payload",
-				"username and newPassword are required",
-			);
-		}
-
-		const db = getDbForEnv(env);
-		const matchedUsers = await db
-			.select({ id: users.id, username: users.username })
-			.from(users)
-			.where(eq(users.username, username))
-			.limit(1);
-
-		const matchedUser = matchedUsers[0];
-		if (!matchedUser) {
-			return errorJson(
-				"forgot-password-hash",
-				404,
-				"User not found",
-				"No user exists with the provided username",
-				{ username },
-			);
-		}
-
-		const passwordHash = await hashPassword(newPassword, env);
-		return json({
-			username: matchedUser.username,
-			passwordHash,
-			hint: "Send this username and password hash to Khanh Luong for manual password reset.",
-		});
-	} catch (error) {
-		return errorJson(
-			"forgot-password-hash",
-			500,
-			"Failed to generate password hash",
-			error.message,
-		);
-	}
-}
-
-async function handlePreviewStats(request) {
-	try {
-		const body = await request.json();
-		const requestedDates = body?.attendedDateStrings;
-
-		if (!Array.isArray(requestedDates)) {
-			return errorJson(
-				"stats-preview",
-				400,
-				"Invalid attendedDateStrings",
-				"Provide an array of ISO dates (YYYY-MM-DD)",
-			);
-		}
-
-		const invalidDate = requestedDates.find(
-			(dateString) => !isValidIsoDate(dateString),
-		);
-
-		if (invalidDate) {
-			return errorJson(
-				"stats-preview",
-				400,
-				"Invalid date",
-				`Invalid ISO date: ${invalidDate}`,
-			);
-		}
-
-		const stats = getBeltStatsFromAttendedDateStrings(requestedDates);
-		return json(stats);
-	} catch (error) {
-		return errorJson(
-			"stats-preview",
-			500,
-			"Failed to compute preview stats",
-			error.message,
-		);
-	}
-}
-
-async function handleToggleAttendanceByDate(request, env) {
-	try {
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.post(
+	"/api/attendance/toggle",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
 		const session = await getSessionFromRequest(request, env);
 		if (!session) {
 			return errorJson(
@@ -895,45 +1045,13 @@ async function handleToggleAttendanceByDate(request, env) {
 			date,
 			message: "Attendance recorded",
 		});
-	} catch (error) {
-		return errorJson(
-			"attendance-toggle",
-			500,
-			"Failed to toggle attendance",
-			error.message,
-		);
-	}
-}
-
-function parseAttendanceMonth(monthToken) {
-	const value = `${monthToken ?? ""}`.trim();
-	const shortMatch = value.match(/^(\d{2})\/(\d{2})$/);
-	if (shortMatch) {
-		const month = Number(shortMatch[1]);
-		const year = 2000 + Number(shortMatch[2]);
-		if (month >= 1 && month <= 12) {
-			return { year, month };
-		}
-	}
-
-	const longMatch = value.match(/^(\d{2})\/(\d{4})$/);
-	if (longMatch) {
-		const month = Number(longMatch[1]);
-		const year = Number(longMatch[2]);
-		if (month >= 1 && month <= 12) {
-			return { year, month };
-		}
-	}
-
-	return null;
-}
-
-function formatMonthRangeBoundary(year, month) {
-	return `${year.toString().padStart(4, "0")}-${month.toString().padStart(2, "0")}-01`;
-}
-
-async function handleAttendanceByMonth(request, env) {
-	try {
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.get(
+	"/api/attendance",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
 		const session = await getSessionFromRequest(request, env);
 		if (!session) {
 			return errorJson(
@@ -979,18 +1097,47 @@ async function handleAttendanceByMonth(request, env) {
 			endDateExclusive,
 			attendedDateStrings: rows.map((row) => row.date),
 		});
-	} catch (error) {
-		return errorJson(
-			"attendance-month",
-			500,
-			"Failed to load attendance",
-			error.message,
-		);
-	}
-}
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.post(
+	"/api/stats/preview",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
+		const body = await request.json();
+		const requestedDates = body?.attendedDateStrings;
 
-async function handleStats(request, env) {
-	try {
+		if (!Array.isArray(requestedDates)) {
+			return errorJson(
+				"stats-preview",
+				400,
+				"Invalid attendedDateStrings",
+				"Provide an array of ISO dates (YYYY-MM-DD)",
+			);
+		}
+
+		const invalidDate = requestedDates.find(
+			(dateString) => !isValidIsoDate(dateString),
+		);
+
+		if (invalidDate) {
+			return errorJson(
+				"stats-preview",
+				400,
+				"Invalid date",
+				`Invalid ISO date: ${invalidDate}`,
+			);
+		}
+
+		const stats = getBeltStatsFromAttendedDateStrings(requestedDates);
+		return json(stats);
+	}),
+	sendWorkerResponseMiddleware,
+);
+app.get(
+	"/api/stats",
+	runWorkerHandler(async (req) => {
+		const request = req.workerRequest;
 		const session = await getSessionFromRequest(request, env);
 		if (!session) {
 			return errorJson(
@@ -1015,292 +1162,16 @@ async function handleStats(request, env) {
 			},
 			200,
 		);
-	} catch (error) {
-		return errorJson(
-			"stats",
-			500,
-			"Failed to compute BELT stats",
-			error.message,
-		);
-	}
-}
-
-async function handleAdminListUsers(request, env) {
-	try {
-		const authResult = await getAuthenticatedUserFromRequest(request, env);
-		if (authResult.errorResponse) {
-			return authResult.errorResponse;
-		}
-
-		const { db, user } = authResult;
-		if (!user.isAdmin) {
-			return errorJson(
-				"admin-list-users",
-				403,
-				"Forbidden",
-				"Admin privileges required",
-				{ username: user.username },
-			);
-		}
-
-		const rows = await db
-			.select({
-				id: users.id,
-				username: users.username,
-				isAdmin: users.isAdmin,
-			})
-			.from(users)
-			.orderBy(asc(users.username));
-
-		return json({
-			users: rows.map((row) => ({
-				id: row.id,
-				username: row.username,
-				isAdmin: Boolean(row.isAdmin),
-			})),
-		});
-	} catch (error) {
-		return errorJson(
-			"admin-list-users",
-			500,
-			"Failed to load users",
-			error.message,
-		);
-	}
-}
-
-async function handleAdminImpersonate(request, env) {
-	try {
-		const authResult = await getAuthenticatedUserFromRequest(request, env);
-		if (authResult.errorResponse) {
-			return authResult.errorResponse;
-		}
-
-		const { db, session, user } = authResult;
-		if (!user.isAdmin) {
-			return errorJson(
-				"admin-impersonate",
-				403,
-				"Forbidden",
-				"Admin privileges required",
-				{ username: user.username },
-			);
-		}
-
-		const body = await request.json();
-		const userId = Number(body?.userId);
-		if (!Number.isInteger(userId) || userId <= 0) {
-			return errorJson(
-				"admin-impersonate",
-				400,
-				"Invalid payload",
-				"userId must be a positive integer",
-			);
-		}
-
-		const matchedUsers = await db
-			.select({
-				id: users.id,
-				username: users.username,
-				uniqueCode: users.uniqueCode,
-				isAdmin: users.isAdmin,
-			})
-			.from(users)
-			.where(eq(users.id, userId))
-			.limit(1);
-
-		const targetUser = matchedUsers[0];
-		if (!targetUser) {
-			return errorJson(
-				"admin-impersonate",
-				404,
-				"User not found",
-				"The selected user does not exist",
-				{ requestedUserId: userId },
-			);
-		}
-
-		const newSessionId = await createSessionForUser(targetUser, db);
-		await deleteSessionById(session.id, env);
-
-		return withSessionCookie(
-			{
-				message: `Now logged in as ${targetUser.username}`,
-				...buildAuthResponse(
-					{ userId: targetUser.id, username: targetUser.username },
-					targetUser,
-				),
-			},
-			newSessionId,
-		);
-	} catch (error) {
-		return errorJson(
-			"admin-impersonate",
-			500,
-			"Failed to impersonate user",
-			error.message,
-		);
-	}
-}
-
-async function handleAdminAuthorization(request, env) {
-	const authResult = await getAuthenticatedUserFromRequest(request, env);
-	if (authResult.errorResponse) {
-		return authResult.errorResponse;
-	}
-
-	if (!authResult.user.isAdmin) {
-		return errorJson(
-			"admin-authz",
-			403,
-			"Forbidden",
-			"Admin privileges required",
-			{ username: authResult.user.username },
-		);
-	}
-
-	return null;
-}
-app.get("/", (_req, res) => {
-	res.json({ message: "Express.js running on Cloudflare Workers!" });
-});
-
-app.post("/api/auth/register", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleRegister(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.post("/api/auth/login", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleLogin(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.post("/api/auth/logout", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleLogout(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.get("/api/auth/me", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleAuthMe(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.post("/api/auth/forgot-password-hash", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleForgotPasswordHash(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.use("/api/admin", async (req, res, next) => {
-	const request = createWorkerRequestFromExpress(req);
-	const response = await handleAdminAuthorization(request, env);
-	if (response) {
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-		return;
-	}
-
-	next();
-});
-app.get("/api/admin/list-users", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleAdminListUsers(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.post("/api/admin/impersonate", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleAdminImpersonate(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.post("/api/record-attendance", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleRecordAttendance(env, request);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.post("/api/attendance/toggle", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleToggleAttendanceByDate(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.get("/api/attendance", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleAttendanceByMonth(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.post("/api/stats/preview", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handlePreviewStats(request);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
-app.get("/api/stats", async (req, res) => {
-	try {
-		const request = createWorkerRequestFromExpress(req);
-		const response = await handleStats(request, env);
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
-	} catch (error) {
-		sendUnhandledRouteError(res, error);
-	}
-});
+	}),
+	sendWorkerResponseMiddleware,
+);
 
 app.use("/api", (_req, res) => {
 	console.error("[api] Not Found", JSON.stringify({ path: _req.originalUrl }));
 	res.status(404).json({ error: "Not Found" });
 });
+
+app.use("/api", handleApiRouteError);
 
 app.listen(3000);
 
