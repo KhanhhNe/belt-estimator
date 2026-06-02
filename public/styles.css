@@ -598,6 +598,36 @@ body {
 	line-height: 1.35;
 }
 
+.calendar-historical-loading {
+	margin: 0.52rem 0 0;
+	font-size: 0.74rem;
+	line-height: 1.35;
+	color: var(--accent);
+	display: inline-flex;
+	align-items: center;
+	gap: 0.36rem;
+	padding: 0.2rem 0.56rem;
+	border: 1px solid #bfd2fb;
+	border-radius: 999px;
+	background: #edf3ff;
+	width: fit-content;
+}
+
+.calendar-historical-loading-spinner {
+	width: 0.7rem;
+	height: 0.7rem;
+	border-radius: 999px;
+	border: 2px solid #9cb8f6;
+	border-top-color: #1d5fe3;
+	animation: calendar-historical-loading-spin 0.8s linear infinite;
+}
+
+@keyframes calendar-historical-loading-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
 .calendar-weekday {
 	text-align: center;
 	font-size: 0.86rem;
@@ -689,6 +719,13 @@ body {
 	background: #dbf4e7;
 	border-color: #95d3af;
 	color: #0f6840;
+}
+
+.calendar-cell-attended-pending {
+	background: #cfead9;
+	border-color: #8fc2a7;
+	color: #1f6b45;
+	opacity: 0.62;
 }
 
 .calendar-cell-attended-user {

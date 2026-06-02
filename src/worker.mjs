@@ -2,7 +2,7 @@ import { httpServerHandler } from "cloudflare:node";
 import { env } from "cloudflare:workers";
 import { createClient } from "@libsql/client/web";
 import bcrypt from "bcryptjs";
-import { eq } from "drizzle-orm";
+import { and, asc, eq, gte, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/libsql";
 import express from "express";
 import schema from "./db/schema.js";
@@ -32,6 +32,10 @@ const API_DOCS = {
 	authMe: "GET /api/auth/me returns current session user info.",
 	authForgotPasswordHash:
 		"POST /api/auth/forgot-password-hash with { username, newPassword } returns a bcrypt hash to share with Khanh Luong for manual reset.",
+	toggleAttendanceByDate:
+		"POST /api/attendance/toggle with { date } toggles attendance for the authenticated session user on a specific YYYY-MM-DD date.",
+	attendanceByMonth:
+		"GET /api/attendance?month=MM/YY returns attendance dates for the authenticated session user in that month.",
 	previewStats:
 		"POST /api/stats/preview accepts attendedDateStrings (array of YYYY-MM-DD) and returns recomputed BELT stats without writing to database.",
 	stats:
@@ -787,6 +791,165 @@ async function handlePreviewStats(request) {
 	}
 }
 
+async function handleToggleAttendanceByDate(request, env) {
+	try {
+		const session = await getSessionFromRequest(request, env);
+		if (!session) {
+			return json(
+				{
+					error: "Authentication required",
+					details: "Log in to toggle attendance",
+				},
+				401,
+			);
+		}
+
+		const body = await request.json();
+		const date = `${body?.date ?? ""}`.trim();
+
+		if (!isValidIsoDate(date)) {
+			return json(
+				{
+					error: "Invalid payload",
+					details: "date is required and must be YYYY-MM-DD",
+				},
+				400,
+			);
+		}
+
+		const db = getDbForEnv(env);
+		const existingRows = await db
+			.select({ id: attendanceRecords.id })
+			.from(attendanceRecords)
+			.where(
+				and(
+					eq(attendanceRecords.userId, session.userId),
+					eq(attendanceRecords.date, date),
+				),
+			)
+			.limit(1);
+
+		const existing = existingRows[0];
+		if (existing) {
+			await db
+				.delete(attendanceRecords)
+				.where(eq(attendanceRecords.id, existing.id));
+
+			return json({
+				action: "deleted",
+				date,
+				message: "Attendance removed",
+			});
+		}
+
+		await db.insert(attendanceRecords).values({
+			userId: session.userId,
+			date,
+		});
+
+		return json({
+			action: "created",
+			date,
+			message: "Attendance recorded",
+		});
+	} catch (error) {
+		return json(
+			{
+				error: "Failed to toggle attendance",
+				details: error.message,
+			},
+			500,
+		);
+	}
+}
+
+function parseAttendanceMonth(monthToken) {
+	const value = `${monthToken ?? ""}`.trim();
+	const shortMatch = value.match(/^(\d{2})\/(\d{2})$/);
+	if (shortMatch) {
+		const month = Number(shortMatch[1]);
+		const year = 2000 + Number(shortMatch[2]);
+		if (month >= 1 && month <= 12) {
+			return { year, month };
+		}
+	}
+
+	const longMatch = value.match(/^(\d{2})\/(\d{4})$/);
+	if (longMatch) {
+		const month = Number(longMatch[1]);
+		const year = Number(longMatch[2]);
+		if (month >= 1 && month <= 12) {
+			return { year, month };
+		}
+	}
+
+	return null;
+}
+
+function formatMonthRangeBoundary(year, month) {
+	return `${year.toString().padStart(4, "0")}-${month.toString().padStart(2, "0")}-01`;
+}
+
+async function handleAttendanceByMonth(request, env) {
+	try {
+		const session = await getSessionFromRequest(request, env);
+		if (!session) {
+			return json(
+				{
+					error: "Authentication required",
+					details: "Log in to access this endpoint",
+				},
+				401,
+			);
+		}
+
+		const url = new URL(request.url);
+		const parsed = parseAttendanceMonth(url.searchParams.get("month"));
+		if (!parsed) {
+			return json(
+				{
+					error: "Invalid month",
+					details: "month query must be MM/YY or MM/YYYY",
+				},
+				400,
+			);
+		}
+
+		const startDate = formatMonthRangeBoundary(parsed.year, parsed.month);
+		const nextMonth = parsed.month === 12 ? 1 : parsed.month + 1;
+		const nextMonthYear = parsed.month === 12 ? parsed.year + 1 : parsed.year;
+		const endDateExclusive = formatMonthRangeBoundary(nextMonthYear, nextMonth);
+
+		const db = getDbForEnv(env);
+		const rows = await db
+			.select({ date: attendanceRecords.date })
+			.from(attendanceRecords)
+			.where(
+				and(
+					eq(attendanceRecords.userId, session.userId),
+					gte(attendanceRecords.date, startDate),
+					lt(attendanceRecords.date, endDateExclusive),
+				),
+			)
+			.orderBy(asc(attendanceRecords.date));
+
+		return json({
+			month: `${parsed.month.toString().padStart(2, "0")}/${String(parsed.year).slice(-2)}`,
+			startDate,
+			endDateExclusive,
+			attendedDateStrings: rows.map((row) => row.date),
+		});
+	} catch (error) {
+		return json(
+			{
+				error: "Failed to load attendance",
+				details: error.message,
+			},
+			500,
+		);
+	}
+}
+
 async function handleStats(request, env) {
 	try {
 		const session = await getSessionFromRequest(request, env);
@@ -851,6 +1014,14 @@ app.post(
 app.post(
 	"/api/record-attendance",
 	routeHandler((request) => handleRecordAttendance(env, request)),
+);
+app.post(
+	"/api/attendance/toggle",
+	routeHandler((request) => handleToggleAttendanceByDate(request, env)),
+);
+app.get(
+	"/api/attendance",
+	routeHandler((request) => handleAttendanceByMonth(request, env)),
 );
 app.post(
 	"/api/stats/preview",

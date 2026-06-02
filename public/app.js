@@ -12,6 +12,10 @@ let uniqueCodeVisible = false;
 let attendancePreviewDebounceTimer = null;
 let attendancePreviewVersion = 0;
 let attendancePreviewRequestId = 0;
+let monthAttendanceInFlight = false;
+let monthAttendanceLoadRequestId = 0;
+const monthAttendanceCache = new Map();
+const pendingPersistenceOperations = new Map();
 
 const ATTENDANCE_PREVIEW_DEBOUNCE_MS = 300;
 
@@ -45,8 +49,16 @@ function renderCurrentStatsPreview() {
 
 	renderStats(statsGrid, {
 		...latestStatsPayload,
-		attendedDateStrings: [...workingAttendedDateSet],
+		attendedDateStrings: getCalendarAttendedDateStringsForViewedMonth(),
 	});
+}
+
+function getPendingPersistenceOperation(dateString) {
+	return pendingPersistenceOperations.get(dateString) ?? null;
+}
+
+function getPersistenceInFlight() {
+	return pendingPersistenceOperations.size > 0;
 }
 
 function renderAuthUi() {
@@ -208,11 +220,13 @@ async function loadStats() {
 		const baselineDates = stats.attendedDateStrings ?? [];
 		baselineAttendedDateSet = new Set(baselineDates);
 		workingAttendedDateSet = new Set(baselineDates);
+		monthAttendanceCache.clear();
 		latestStatsPayload = stats;
 		if (!viewedMonthDateString) {
 			viewedMonthDateString = getMonthStartDateString(stats.currentDate);
 		}
 		renderStats(statsGrid, stats);
+		void ensureViewedMonthAttendanceLoaded();
 	} catch (error) {
 		statsGrid.innerHTML = `
       <article class="stat-card stat-card-primary">
@@ -274,6 +288,111 @@ function formatMonthLabel(dateString) {
 	}).format(date);
 }
 
+function getMonthQueryToken(monthDateString) {
+	const monthDate = parseIsoDate(monthDateString);
+	const month = `${monthDate.getUTCMonth() + 1}`.padStart(2, "0");
+	const year = `${monthDate.getUTCFullYear()}`.slice(-2);
+	return `${month}/${year}`;
+}
+
+function getTrailingWindowStartDateString(statsPayload) {
+	if (!statsPayload?.currentDate) {
+		return null;
+	}
+
+	const windowWeeks = Number(statsPayload?.metadata?.windowWeeks ?? 12);
+	const currentDate = parseIsoDate(statsPayload.currentDate);
+	const mondayOffset = (currentDate.getUTCDay() + 6) % 7;
+	currentDate.setUTCDate(currentDate.getUTCDate() - mondayOffset);
+	currentDate.setUTCDate(currentDate.getUTCDate() - windowWeeks * 7);
+	return formatIsoDate(currentDate);
+}
+
+function isViewedMonthOutsideTrailingWindow() {
+	if (!latestStatsPayload || !viewedMonthDateString) {
+		return false;
+	}
+
+	const trailingStart = getTrailingWindowStartDateString(latestStatsPayload);
+	if (!trailingStart) {
+		return false;
+	}
+
+	return viewedMonthDateString < trailingStart;
+}
+
+function getCalendarAttendedDateStringsForViewedMonth() {
+	const attendedDates = isViewedMonthOutsideTrailingWindow()
+		? new Set(monthAttendanceCache.get(viewedMonthDateString) ?? [])
+		: new Set(workingAttendedDateSet);
+
+	for (const [
+		dateString,
+		operation,
+	] of pendingPersistenceOperations.entries()) {
+		if (getMonthStartDateString(dateString) !== viewedMonthDateString) {
+			continue;
+		}
+
+		if (operation.shouldMarkAttended) {
+			attendedDates.add(dateString);
+		} else {
+			attendedDates.delete(dateString);
+		}
+	}
+
+	return [...attendedDates];
+}
+
+async function loadViewedMonthAttendance() {
+	if (!currentUser || !viewedMonthDateString) {
+		return;
+	}
+
+	if (!isViewedMonthOutsideTrailingWindow()) {
+		return;
+	}
+
+	if (monthAttendanceCache.has(viewedMonthDateString)) {
+		return;
+	}
+
+	const requestId = ++monthAttendanceLoadRequestId;
+	monthAttendanceInFlight = true;
+	renderCurrentStatsPreview();
+
+	try {
+		const month = getMonthQueryToken(viewedMonthDateString);
+		const payload = await fetchJsonOrThrow(
+			`/api/attendance?month=${encodeURIComponent(month)}`,
+		);
+		if (requestId !== monthAttendanceLoadRequestId) {
+			return;
+		}
+
+		monthAttendanceCache.set(
+			viewedMonthDateString,
+			new Set(payload?.attendedDateStrings ?? []),
+		);
+		renderCurrentStatsPreview();
+	} catch (error) {
+		if (requestId !== monthAttendanceLoadRequestId) {
+			return;
+		}
+
+		console.error("Failed to load attendance for viewed month", error);
+	} finally {
+		if (requestId === monthAttendanceLoadRequestId) {
+			monthAttendanceInFlight = false;
+			renderCurrentStatsPreview();
+		}
+	}
+}
+
+async function ensureViewedMonthAttendanceLoaded() {
+	await loadViewedMonthAttendance();
+}
+
 function buildMonthCalendarCells(
 	monthDateString,
 	todayDateString,
@@ -296,6 +415,9 @@ function buildMonthCalendarCells(
 		const leadIso = formatIsoDate(leadDate);
 		const leadDay = leadDate.getUTCDate();
 		const isAttended = attendedSet.has(leadIso);
+		const pendingPersistenceOperation = getPendingPersistenceOperation(leadIso);
+		const isPendingPersistCreate =
+			pendingPersistenceOperation?.shouldMarkAttended === true;
 		const isUserUpdatedAttended =
 			isAttended && !baselineAttendedDateSet.has(leadIso);
 		const isToday = leadIso === todayDateString;
@@ -310,6 +432,9 @@ function buildMonthCalendarCells(
 		if (isToday) {
 			className += " calendar-cell-today";
 		}
+		if (isPendingPersistCreate) {
+			className += " calendar-cell-attended-pending";
+		}
 
 		cells.push(
 			`<div class="${className} calendar-cell-clickable" data-date="${leadIso}" role="button" tabindex="0" aria-pressed="${isAttended}" title="${isAttended ? "Marked attended (temporary). Click to unmark." : "Not marked attended. Click to mark temporarily."}"><span class="calendar-day-number">${leadDay}</span></div>`,
@@ -321,6 +446,9 @@ function buildMonthCalendarCells(
 		const iso = date.toISOString().slice(0, 10);
 
 		const isAttended = attendedSet.has(iso);
+		const pendingPersistenceOperation = getPendingPersistenceOperation(iso);
+		const isPendingPersistCreate =
+			pendingPersistenceOperation?.shouldMarkAttended === true;
 		const isUserUpdatedAttended =
 			isAttended && !baselineAttendedDateSet.has(iso);
 		const isToday = iso === todayDateString;
@@ -334,6 +462,9 @@ function buildMonthCalendarCells(
 		}
 		if (isToday) {
 			className += " calendar-cell-today";
+		}
+		if (isPendingPersistCreate) {
+			className += " calendar-cell-attended-pending";
 		}
 
 		cells.push(
@@ -350,6 +481,10 @@ function buildMonthCalendarCells(
 		const trailingDate = new Date(Date.UTC(year, month + 1, trailingDay));
 		const trailingIso = formatIsoDate(trailingDate);
 		const isAttended = attendedSet.has(trailingIso);
+		const pendingPersistenceOperation =
+			getPendingPersistenceOperation(trailingIso);
+		const isPendingPersistCreate =
+			pendingPersistenceOperation?.shouldMarkAttended === true;
 		const isUserUpdatedAttended =
 			isAttended && !baselineAttendedDateSet.has(trailingIso);
 		const isToday = trailingIso === todayDateString;
@@ -363,6 +498,9 @@ function buildMonthCalendarCells(
 		}
 		if (isToday) {
 			className += " calendar-cell-today";
+		}
+		if (isPendingPersistCreate) {
+			className += " calendar-cell-attended-pending";
 		}
 
 		cells.push(
@@ -424,12 +562,24 @@ function renderStats(target, payload) {
 		)
 		.join("");
 
-	const dashboardLoadingClass = attendanceUpdateInFlight
-		? " dashboard-layout-preview-loading"
+	const dashboardLoadingClass =
+		attendanceUpdateInFlight ||
+		getPersistenceInFlight() ||
+		monthAttendanceInFlight
+			? " dashboard-layout-preview-loading"
+			: "";
+	const usageHintText =
+		attendanceUpdateInFlight ||
+		getPersistenceInFlight() ||
+		monthAttendanceInFlight
+			? "Updating preview..."
+			: "Tip: Click any date to preview. Ctrl+Click (or Cmd+Click) to save to database.";
+	const showHistoricalLoadingBadge =
+		monthAttendanceInFlight && isViewedMonthOutsideTrailingWindow();
+
+	const historicalLoadingBadgeMarkup = showHistoricalLoadingBadge
+		? `<p class="calendar-historical-loading" role="status" aria-live="polite"><span class="calendar-historical-loading-spinner" aria-hidden="true"></span>Loading historical month attendance...</p>`
 		: "";
-	const usageHintText = attendanceUpdateInFlight
-		? "Updating preview..."
-		: "Tip: Click any date to preview stat changes.";
 
 	target.innerHTML = `
 		<section class="dashboard-layout${dashboardLoadingClass}">
@@ -450,6 +600,7 @@ function renderStats(target, payload) {
 					<span class="calendar-legend-item"><span class="calendar-legend-dot calendar-legend-dot-attended-user"></span>User updated</span>
 					<span class="calendar-legend-item"><span class="calendar-legend-dot calendar-legend-dot-today"></span>Today</span>
 				</div>
+				${historicalLoadingBadgeMarkup}
 				<p class="calendar-usage-hint">${usageHintText}</p>
 			</article>
 
@@ -565,13 +716,104 @@ async function handleAttendanceToggleCell(calendarCell) {
 	scheduleAttendancePreviewRefresh();
 }
 
+async function persistAttendanceToggle(dateString) {
+	if (!currentUser) {
+		throw new Error("Authentication required");
+	}
+
+	const response = await fetch("/api/attendance/toggle", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({ date: dateString }),
+	});
+
+	if (!response.ok) {
+		let payload = null;
+		try {
+			payload = await response.json();
+		} catch {
+			payload = null;
+		}
+
+		throw new Error(
+			payload?.error || payload?.details || `HTTP ${response.status}`,
+		);
+	}
+
+	return response.json();
+}
+
+async function handleAttendancePersistentToggle(calendarCell) {
+	const dateString = calendarCell.dataset.date;
+	if (!dateString) {
+		return;
+	}
+
+	if (pendingPersistenceOperations.has(dateString)) {
+		return;
+	}
+
+	const currentAttendedDates = new Set(
+		getCalendarAttendedDateStringsForViewedMonth(),
+	);
+	const shouldMarkAttended = !currentAttendedDates.has(dateString);
+	const operation = {
+		shouldMarkAttended,
+		requestId: crypto.randomUUID(),
+	};
+	pendingPersistenceOperations.set(dateString, operation);
+
+	renderCurrentStatsPreview();
+
+	try {
+		await persistAttendanceToggle(dateString);
+
+		const settledOperation = pendingPersistenceOperations.get(dateString);
+		if (
+			!settledOperation ||
+			settledOperation.requestId !== operation.requestId
+		) {
+			return;
+		}
+
+		if (operation.shouldMarkAttended) {
+			baselineAttendedDateSet.add(dateString);
+			workingAttendedDateSet.add(dateString);
+		} else {
+			baselineAttendedDateSet.delete(dateString);
+			workingAttendedDateSet.delete(dateString);
+		}
+
+		const monthStart = getMonthStartDateString(dateString);
+		if (monthAttendanceCache.has(monthStart)) {
+			const monthSet = new Set(monthAttendanceCache.get(monthStart));
+			if (operation.shouldMarkAttended) {
+				monthSet.add(dateString);
+			} else {
+				monthSet.delete(dateString);
+			}
+			monthAttendanceCache.set(monthStart, monthSet);
+		}
+	} catch (error) {
+		console.error("Failed to toggle attendance persistently", error);
+	} finally {
+		const settledOperation = pendingPersistenceOperations.get(dateString);
+		if (settledOperation?.requestId === operation.requestId) {
+			pendingPersistenceOperations.delete(dateString);
+		}
+		renderCurrentStatsPreview();
+	}
+}
+
 function registerCalendarInteractions() {
 	const statsGrid = document.getElementById("stats-grid");
 	if (!statsGrid) {
 		return;
 	}
 
-	function changeViewedMonth(monthOffset) {
+	async function changeViewedMonth(monthOffset) {
 		if (!latestStatsPayload || !viewedMonthDateString) {
 			return;
 		}
@@ -581,6 +823,7 @@ function registerCalendarInteractions() {
 			monthOffset,
 		);
 		renderStats(statsGrid, latestStatsPayload);
+		await ensureViewedMonthAttendanceLoaded();
 	}
 
 	statsGrid.addEventListener("click", (event) => {
@@ -594,7 +837,7 @@ function registerCalendarInteractions() {
 				monthNavButton.getAttribute("data-month-offset"),
 			);
 			if (Number.isInteger(monthOffset)) {
-				changeViewedMonth(monthOffset);
+				void changeViewedMonth(monthOffset);
 			}
 			return;
 		}
@@ -604,7 +847,12 @@ function registerCalendarInteractions() {
 			return;
 		}
 
-		handleAttendanceToggleCell(calendarCell);
+		if (event.ctrlKey || event.metaKey) {
+			void handleAttendancePersistentToggle(calendarCell);
+			return;
+		}
+
+		void handleAttendanceToggleCell(calendarCell);
 	});
 
 	statsGrid.addEventListener("keydown", (event) => {
@@ -622,7 +870,13 @@ function registerCalendarInteractions() {
 		}
 
 		event.preventDefault();
-		handleAttendanceToggleCell(calendarCell);
+
+		if (event.ctrlKey || event.metaKey) {
+			void handleAttendancePersistentToggle(calendarCell);
+			return;
+		}
+
+		void handleAttendanceToggleCell(calendarCell);
 	});
 }
 
