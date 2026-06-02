@@ -9,6 +9,11 @@ let authViewMode = "login";
 let forgotPasswordResult = null;
 let forgotPasswordDraft = null;
 let uniqueCodeVisible = false;
+let adminUsers = [];
+let selectedAdminUserId = null;
+let adminUsersLoading = false;
+let adminImpersonationInFlight = false;
+let adminPanelMessage = "";
 let attendancePreviewDebounceTimer = null;
 let attendancePreviewVersion = 0;
 let attendancePreviewRequestId = 0;
@@ -72,6 +77,29 @@ function renderAuthUi() {
 	}
 
 	if (currentUser) {
+		const adminUserOptionsMarkup = adminUsers
+			.map((user) => {
+				const optionLabel = user.isAdmin
+					? `${user.username} (admin)`
+					: user.username;
+				return `<option value="${user.id}" ${String(user.id) === String(selectedAdminUserId) ? "selected" : ""}>${escapeHtml(optionLabel)}</option>`;
+			})
+			.join("");
+		const adminSectionMarkup = currentUser.isAdmin
+			? `<div class="auth-note auth-note-warning admin-impersonation-card">
+				<p class="auth-note-title">Admin: Login As Another User</p>
+				<p class="auth-note-text">Select a user, then switch this browser session to that account.</p>
+				<div class="auth-inline-actions admin-impersonation-row">
+					<select id="admin-user-select" class="auth-input admin-user-select" ${adminUsersLoading || adminImpersonationInFlight ? "disabled" : ""}>
+						${adminUserOptionsMarkup}
+					</select>
+					<button type="button" class="auth-button auth-button-primary" data-auth-action="admin-impersonate" ${adminUsersLoading || adminImpersonationInFlight || !selectedAdminUserId ? "disabled" : ""}>${adminImpersonationInFlight ? "Switching..." : "Login As User"}</button>
+				</div>
+				${adminUsersLoading ? '<p class="auth-inline-message">Loading users...</p>' : ""}
+				${adminPanelMessage ? `<p class="auth-inline-message">${escapeHtml(adminPanelMessage)}</p>` : ""}
+			</div>`
+			: "";
+
 		greetingElement.textContent = `Hello ${currentUser.username} on home`;
 		actionBar.innerHTML = `
 			<button type="button" class="auth-button auth-button-danger" data-auth-action="logout">Logout</button>
@@ -89,6 +117,7 @@ function renderAuthUi() {
 					<button type="button" class="auth-button auth-eye-button" data-auth-action="toggle-unique-code-visibility" aria-label="${uniqueCodeVisible ? "Hide unique code" : "Show unique code"}">${uniqueCodeVisible ? "🙈" : "👁"}</button>
 				</div>
 			</div>
+			${adminSectionMarkup}
 		`;
 		forgotPasswordResult = null;
 		forgotPasswordDraft = null;
@@ -100,6 +129,11 @@ function renderAuthUi() {
 	actionBar.innerHTML = "";
 	authPanel.hidden = false;
 	uniqueCodeVisible = false;
+	adminUsers = [];
+	selectedAdminUserId = null;
+	adminUsersLoading = false;
+	adminImpersonationInFlight = false;
+	adminPanelMessage = "";
 	uniqueCodeFooter.hidden = true;
 	uniqueCodeFooter.innerHTML = "";
 
@@ -183,6 +217,49 @@ async function syncAuthState() {
 	}
 
 	renderAuthUi();
+	await loadAdminUsersIfNeeded();
+}
+
+async function loadAdminUsersIfNeeded() {
+	if (!currentUser?.isAdmin) {
+		adminUsers = [];
+		selectedAdminUserId = null;
+		adminUsersLoading = false;
+		adminImpersonationInFlight = false;
+		adminPanelMessage = "";
+		renderAuthUi();
+		return;
+	}
+
+	adminUsersLoading = true;
+	adminPanelMessage = "";
+	renderAuthUi();
+
+	try {
+		const payload = await fetchJsonOrThrow("/api/admin/list-users");
+		adminUsers = (payload?.users ?? []).map((user) => ({
+			id: Number(user.id),
+			username: `${user.username ?? ""}`,
+			isAdmin: Boolean(user.isAdmin),
+		}));
+
+		if (adminUsers.length === 0) {
+			selectedAdminUserId = null;
+		} else if (
+			!adminUsers.some(
+				(user) => String(user.id) === String(selectedAdminUserId),
+			)
+		) {
+			selectedAdminUserId = String(adminUsers[0].id);
+		}
+	} catch (error) {
+		adminUsers = [];
+		selectedAdminUserId = null;
+		adminPanelMessage = `Failed to load users: ${error.message}`;
+	} finally {
+		adminUsersLoading = false;
+		renderAuthUi();
+	}
 }
 
 async function loadStats() {
@@ -908,6 +985,11 @@ function registerAuthInteractions() {
 			await fetchJsonOrThrow("/api/auth/logout", { method: "POST" });
 			currentUser = null;
 			uniqueCodeVisible = false;
+			adminUsers = [];
+			selectedAdminUserId = null;
+			adminUsersLoading = false;
+			adminImpersonationInFlight = false;
+			adminPanelMessage = "";
 			authPanelMessage = "Logged out successfully.";
 			baselineAttendedDateSet = new Set();
 			workingAttendedDateSet = new Set();
@@ -1011,7 +1093,61 @@ function registerAuthInteractions() {
 		if (action === "toggle-unique-code-visibility") {
 			uniqueCodeVisible = !uniqueCodeVisible;
 			renderAuthUi();
+			return;
 		}
+
+		if (action === "admin-impersonate") {
+			if (!currentUser?.isAdmin || !selectedAdminUserId) {
+				return;
+			}
+
+			adminImpersonationInFlight = true;
+			adminPanelMessage = "";
+			renderAuthUi();
+
+			try {
+				const result = await fetchJsonOrThrow("/api/admin/impersonate", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
+						userId: Number(selectedAdminUserId),
+					}),
+				});
+
+				currentUser = result?.user ?? null;
+				authPanelMessage = result?.message ?? "Switched user successfully.";
+				baselineAttendedDateSet = new Set();
+				workingAttendedDateSet = new Set();
+				latestStatsPayload = null;
+				viewedMonthDateString = null;
+				adminUsers = [];
+				selectedAdminUserId = null;
+				adminPanelMessage = "";
+				renderAuthUi();
+				await loadStats();
+			} catch (error) {
+				adminPanelMessage = `Failed to login as selected user: ${error.message}`;
+				renderAuthUi();
+			} finally {
+				adminImpersonationInFlight = false;
+				renderAuthUi();
+			}
+		}
+	});
+
+	uniqueCodeFooter.addEventListener("change", (event) => {
+		if (!(event.target instanceof HTMLSelectElement)) {
+			return;
+		}
+
+		if (event.target.id !== "admin-user-select") {
+			return;
+		}
+
+		selectedAdminUserId = event.target.value;
+		renderAuthUi();
 	});
 
 	authPanel.addEventListener("submit", async (event) => {
@@ -1085,6 +1221,7 @@ function registerAuthInteractions() {
 			latestStatsPayload = null;
 			viewedMonthDateString = null;
 			renderAuthUi();
+			await loadAdminUsersIfNeeded();
 			loadStats();
 		} catch (error) {
 			authPanelMessage = `Authentication failed: ${error.message}`;

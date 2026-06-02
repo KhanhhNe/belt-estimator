@@ -30,6 +30,9 @@ const API_DOCS = {
 		"POST /api/auth/login with { username, password } starts a session.",
 	authLogout: "POST /api/auth/logout clears the current session.",
 	authMe: "GET /api/auth/me returns current session user info.",
+	adminListUsers: "GET /api/admin/list-users returns all users (admin only).",
+	adminImpersonate:
+		"POST /api/admin/impersonate with { userId } signs in as the selected user (admin only).",
 	authForgotPasswordHash:
 		"POST /api/auth/forgot-password-hash with { username, newPassword } returns a bcrypt hash to share with Khanh Luong for manual reset.",
 	toggleAttendanceByDate:
@@ -144,19 +147,43 @@ async function sendWorkerResponseToExpress(res, response) {
 	res.send(await response.text());
 }
 
-function routeHandler(handler) {
-	return async (req, res) => {
+function sendUnhandledRouteError(res, error) {
+	console.error("Unhandled error in route handler", error);
+	res.status(500).json({
+		error: "Unhandled worker route error",
+		details: error?.message,
+	});
+}
+
+async function logWorkerErrorResponseIfNeeded(req, response) {
+	if (!response || response.status < 400) {
+		return;
+	}
+
+	const contentType = response.headers.get("content-type") ?? "";
+	let payloadError = null;
+	let payloadDetails = null;
+
+	if (contentType.includes("application/json")) {
 		try {
-			const request = createWorkerRequestFromExpress(req);
-			const response = await handler(request);
-			await sendWorkerResponseToExpress(res, response);
-		} catch (error) {
-			res.status(500).json({
-				error: "Unhandled worker route error",
-				details: error?.message,
-			});
+			const payload = await response.clone().json();
+			payloadError = payload?.error ?? null;
+			payloadDetails = payload?.details ?? null;
+		} catch {
+			// Ignore parsing errors for non-JSON/empty error responses.
 		}
-	};
+	}
+
+	console.error(
+		"[api-error-response]",
+		JSON.stringify({
+			method: req.method,
+			path: req.originalUrl,
+			status: response.status,
+			error: payloadError,
+			details: payloadDetails,
+		}),
+	);
 }
 
 function getUtcPlus7DateString(now = new Date()) {
@@ -200,6 +227,16 @@ function json(data, status = 200) {
 			"Content-Type": "application/json",
 		},
 	});
+}
+
+function errorJson(_context, status, errorMessage, details, _metadata = {}) {
+	return json(
+		{
+			error: errorMessage,
+			details,
+		},
+		status,
+	);
 }
 
 function parseCookies(cookieHeader = "") {
@@ -308,7 +345,52 @@ function buildAuthResponse(session, user = null) {
 			id: session.userId,
 			username: user?.username ?? session.username,
 			uniqueCode: user?.uniqueCode,
+			isAdmin: Boolean(user?.isAdmin),
 		},
+	};
+}
+
+async function getAuthenticatedUserFromRequest(request, env) {
+	const session = await getSessionFromRequest(request, env);
+	if (!session) {
+		return {
+			errorResponse: errorJson(
+				"auth",
+				401,
+				"Authentication required",
+				"Log in to access this endpoint",
+			),
+		};
+	}
+
+	const db = getDbForEnv(env);
+	const matchedUsers = await db
+		.select({
+			id: users.id,
+			username: users.username,
+			uniqueCode: users.uniqueCode,
+			isAdmin: users.isAdmin,
+		})
+		.from(users)
+		.where(eq(users.id, session.userId))
+		.limit(1);
+
+	const matchedUser = matchedUsers[0];
+	if (!matchedUser) {
+		console.error(
+			"[auth] Session user not found; clearing session",
+			JSON.stringify({ sessionId: session.id, userId: session.userId }),
+		);
+		await deleteSessionById(session.id, env);
+		return {
+			errorResponse: withClearedSessionCookie(buildAuthResponse(null)),
+		};
+	}
+
+	return {
+		db,
+		session,
+		user: matchedUser,
 	};
 }
 
@@ -419,16 +501,14 @@ async function handleRecordAttendance(env, request) {
 		);
 
 		if (!userUniqueCode) {
-			console.warn(
+			console.error(
 				`${logPrefix} Missing User-Unique-Code header after ${Date.now() - requestStartedAt}ms`,
 			);
-			return json(
-				{
-					error: "Missing User-Unique-Code",
-					details:
-						"Provide header User-Unique-Code with a valid user unique code",
-				},
+			return errorJson(
+				"record-attendance",
 				401,
+				"Missing User-Unique-Code",
+				"Provide header User-Unique-Code with a valid user unique code",
 			);
 		}
 
@@ -440,19 +520,18 @@ async function handleRecordAttendance(env, request) {
 
 		const matchedUser = matchedUsers[0];
 		if (!matchedUser) {
-			console.warn(
+			console.error(
 				`${logPrefix} Invalid unique code`,
 				JSON.stringify({
 					uniqueCodeHint: maskUniqueCode(userUniqueCode),
 					durationMs: Date.now() - requestStartedAt,
 				}),
 			);
-			return json(
-				{
-					error: "Invalid User-Unique-Code",
-					details: "The provided unique code does not match any user",
-				},
+			return errorJson(
+				"record-attendance",
 				403,
+				"Invalid User-Unique-Code",
+				"The provided unique code does not match any user",
 			);
 		}
 
@@ -493,12 +572,11 @@ async function handleRecordAttendance(env, request) {
 				stack: error?.stack,
 			}),
 		);
-		return json(
-			{
-				error: "Failed to record attendance",
-				details: error.message,
-			},
+		return errorJson(
+			"record-attendance",
 			500,
+			"Failed to record attendance",
+			error.message,
 		);
 	}
 }
@@ -510,12 +588,11 @@ async function handleRegister(request, env) {
 		const password = `${body?.password ?? ""}`;
 
 		if (!username || !password) {
-			return json(
-				{
-					error: "Invalid payload",
-					details: "username and password are required",
-				},
+			return errorJson(
+				"auth-register",
 				400,
+				"Invalid payload",
+				"username and password are required",
 			);
 		}
 
@@ -527,12 +604,12 @@ async function handleRegister(request, env) {
 			.limit(1);
 
 		if (existingUsers.length > 0) {
-			return json(
-				{
-					error: "Username already exists",
-					details: "Choose another username",
-				},
+			return errorJson(
+				"auth-register",
 				409,
+				"Username already exists",
+				"Choose another username",
+				{ username },
 			);
 		}
 
@@ -545,6 +622,7 @@ async function handleRegister(request, env) {
 				id: users.id,
 				username: users.username,
 				uniqueCode: users.uniqueCode,
+				isAdmin: users.isAdmin,
 			});
 
 		const insertedUser = insertedUsers[0];
@@ -561,13 +639,7 @@ async function handleRegister(request, env) {
 			201,
 		);
 	} catch (error) {
-		return json(
-			{
-				error: "Failed to register",
-				details: error.message,
-			},
-			500,
-		);
+		return errorJson("auth-register", 500, "Failed to register", error.message);
 	}
 }
 
@@ -578,12 +650,11 @@ async function handleLogin(request, env) {
 		const password = `${body?.password ?? ""}`;
 
 		if (!username || !password) {
-			return json(
-				{
-					error: "Invalid payload",
-					details: "username and password are required",
-				},
+			return errorJson(
+				"auth-login",
 				400,
+				"Invalid payload",
+				"username and password are required",
 			);
 		}
 
@@ -594,6 +665,7 @@ async function handleLogin(request, env) {
 				username: users.username,
 				password: users.password,
 				uniqueCode: users.uniqueCode,
+				isAdmin: users.isAdmin,
 			})
 			.from(users)
 			.where(eq(users.username, username))
@@ -601,12 +673,12 @@ async function handleLogin(request, env) {
 
 		const matchedUser = matchedUsers[0];
 		if (!matchedUser) {
-			return json(
-				{
-					error: "Invalid credentials",
-					details: "Incorrect username or password",
-				},
+			return errorJson(
+				"auth-login",
 				401,
+				"Invalid credentials",
+				"Incorrect username or password",
+				{ username },
 			);
 		}
 
@@ -616,12 +688,12 @@ async function handleLogin(request, env) {
 			env,
 		);
 		if (!isPasswordValid) {
-			return json(
-				{
-					error: "Invalid credentials",
-					details: "Incorrect username or password",
-				},
+			return errorJson(
+				"auth-login",
 				401,
+				"Invalid credentials",
+				"Incorrect username or password",
+				{ username },
 			);
 		}
 
@@ -637,13 +709,7 @@ async function handleLogin(request, env) {
 			sessionId,
 		);
 	} catch (error) {
-		return json(
-			{
-				error: "Failed to login",
-				details: error.message,
-			},
-			500,
-		);
+		return errorJson("auth-login", 500, "Failed to login", error.message);
 	}
 }
 
@@ -661,39 +727,23 @@ async function handleLogout(request, env) {
 
 async function handleAuthMe(request, env) {
 	try {
-		const session = await getSessionFromRequest(request, env);
-		if (!session) {
-			return json(buildAuthResponse(null));
+		const authResult = await getAuthenticatedUserFromRequest(request, env);
+		if (authResult.errorResponse) {
+			if (authResult.errorResponse.status === 401) {
+				return json(buildAuthResponse(null));
+			}
+
+			return authResult.errorResponse;
 		}
 
-		const db = getDbForEnv(env);
-		const matchedUsers = await db
-			.select({
-				id: users.id,
-				username: users.username,
-				uniqueCode: users.uniqueCode,
-			})
-			.from(users)
-			.where(eq(users.id, session.userId))
-			.limit(1);
-
-		const matchedUser = matchedUsers[0];
-		if (!matchedUser) {
-			await deleteSessionById(session.id, env);
-			return withClearedSessionCookie(buildAuthResponse(null));
-		}
-
-		return withSessionCookie(
-			buildAuthResponse(session, matchedUser),
-			session.id,
-		);
+		const { session, user } = authResult;
+		return withSessionCookie(buildAuthResponse(session, user), session.id);
 	} catch (error) {
-		return json(
-			{
-				error: "Failed to load auth state",
-				details: error.message,
-			},
+		return errorJson(
+			"auth-me",
 			500,
+			"Failed to load auth state",
+			error.message,
 		);
 	}
 }
@@ -705,12 +755,11 @@ async function handleForgotPasswordHash(request, env) {
 		const newPassword = `${body?.newPassword ?? ""}`;
 
 		if (!username || !newPassword) {
-			return json(
-				{
-					error: "Invalid payload",
-					details: "username and newPassword are required",
-				},
+			return errorJson(
+				"forgot-password-hash",
 				400,
+				"Invalid payload",
+				"username and newPassword are required",
 			);
 		}
 
@@ -723,12 +772,12 @@ async function handleForgotPasswordHash(request, env) {
 
 		const matchedUser = matchedUsers[0];
 		if (!matchedUser) {
-			return json(
-				{
-					error: "User not found",
-					details: "No user exists with the provided username",
-				},
+			return errorJson(
+				"forgot-password-hash",
 				404,
+				"User not found",
+				"No user exists with the provided username",
+				{ username },
 			);
 		}
 
@@ -739,12 +788,11 @@ async function handleForgotPasswordHash(request, env) {
 			hint: "Send this username and password hash to Khanh Luong for manual password reset.",
 		});
 	} catch (error) {
-		return json(
-			{
-				error: "Failed to generate password hash",
-				details: error.message,
-			},
+		return errorJson(
+			"forgot-password-hash",
 			500,
+			"Failed to generate password hash",
+			error.message,
 		);
 	}
 }
@@ -755,12 +803,11 @@ async function handlePreviewStats(request) {
 		const requestedDates = body?.attendedDateStrings;
 
 		if (!Array.isArray(requestedDates)) {
-			return json(
-				{
-					error: "Invalid attendedDateStrings",
-					details: "Provide an array of ISO dates (YYYY-MM-DD)",
-				},
+			return errorJson(
+				"stats-preview",
 				400,
+				"Invalid attendedDateStrings",
+				"Provide an array of ISO dates (YYYY-MM-DD)",
 			);
 		}
 
@@ -769,24 +816,22 @@ async function handlePreviewStats(request) {
 		);
 
 		if (invalidDate) {
-			return json(
-				{
-					error: "Invalid date",
-					details: `Invalid ISO date: ${invalidDate}`,
-				},
+			return errorJson(
+				"stats-preview",
 				400,
+				"Invalid date",
+				`Invalid ISO date: ${invalidDate}`,
 			);
 		}
 
 		const stats = getBeltStatsFromAttendedDateStrings(requestedDates);
 		return json(stats);
 	} catch (error) {
-		return json(
-			{
-				error: "Failed to compute preview stats",
-				details: error.message,
-			},
+		return errorJson(
+			"stats-preview",
 			500,
+			"Failed to compute preview stats",
+			error.message,
 		);
 	}
 }
@@ -795,12 +840,11 @@ async function handleToggleAttendanceByDate(request, env) {
 	try {
 		const session = await getSessionFromRequest(request, env);
 		if (!session) {
-			return json(
-				{
-					error: "Authentication required",
-					details: "Log in to toggle attendance",
-				},
+			return errorJson(
+				"attendance-toggle",
 				401,
+				"Authentication required",
+				"Log in to toggle attendance",
 			);
 		}
 
@@ -808,12 +852,11 @@ async function handleToggleAttendanceByDate(request, env) {
 		const date = `${body?.date ?? ""}`.trim();
 
 		if (!isValidIsoDate(date)) {
-			return json(
-				{
-					error: "Invalid payload",
-					details: "date is required and must be YYYY-MM-DD",
-				},
+			return errorJson(
+				"attendance-toggle",
 				400,
+				"Invalid payload",
+				"date is required and must be YYYY-MM-DD",
 			);
 		}
 
@@ -853,12 +896,11 @@ async function handleToggleAttendanceByDate(request, env) {
 			message: "Attendance recorded",
 		});
 	} catch (error) {
-		return json(
-			{
-				error: "Failed to toggle attendance",
-				details: error.message,
-			},
+		return errorJson(
+			"attendance-toggle",
 			500,
+			"Failed to toggle attendance",
+			error.message,
 		);
 	}
 }
@@ -894,24 +936,22 @@ async function handleAttendanceByMonth(request, env) {
 	try {
 		const session = await getSessionFromRequest(request, env);
 		if (!session) {
-			return json(
-				{
-					error: "Authentication required",
-					details: "Log in to access this endpoint",
-				},
+			return errorJson(
+				"attendance-month",
 				401,
+				"Authentication required",
+				"Log in to access this endpoint",
 			);
 		}
 
 		const url = new URL(request.url);
 		const parsed = parseAttendanceMonth(url.searchParams.get("month"));
 		if (!parsed) {
-			return json(
-				{
-					error: "Invalid month",
-					details: "month query must be MM/YY or MM/YYYY",
-				},
+			return errorJson(
+				"attendance-month",
 				400,
+				"Invalid month",
+				"month query must be MM/YY or MM/YYYY",
 			);
 		}
 
@@ -940,12 +980,11 @@ async function handleAttendanceByMonth(request, env) {
 			attendedDateStrings: rows.map((row) => row.date),
 		});
 	} catch (error) {
-		return json(
-			{
-				error: "Failed to load attendance",
-				details: error.message,
-			},
+		return errorJson(
+			"attendance-month",
 			500,
+			"Failed to load attendance",
+			error.message,
 		);
 	}
 }
@@ -954,12 +993,11 @@ async function handleStats(request, env) {
 	try {
 		const session = await getSessionFromRequest(request, env);
 		if (!session) {
-			return json(
-				{
-					error: "Authentication required",
-					details: "Log in to access this endpoint",
-				},
+			return errorJson(
+				"stats",
 				401,
+				"Authentication required",
+				"Log in to access this endpoint",
 			);
 		}
 
@@ -978,61 +1016,289 @@ async function handleStats(request, env) {
 			200,
 		);
 	} catch (error) {
-		return json(
-			{
-				error: "Failed to compute BELT stats",
-				details: error.message,
-			},
+		return errorJson(
+			"stats",
 			500,
+			"Failed to compute BELT stats",
+			error.message,
 		);
 	}
+}
+
+async function handleAdminListUsers(request, env) {
+	try {
+		const authResult = await getAuthenticatedUserFromRequest(request, env);
+		if (authResult.errorResponse) {
+			return authResult.errorResponse;
+		}
+
+		const { db, user } = authResult;
+		if (!user.isAdmin) {
+			return errorJson(
+				"admin-list-users",
+				403,
+				"Forbidden",
+				"Admin privileges required",
+				{ username: user.username },
+			);
+		}
+
+		const rows = await db
+			.select({
+				id: users.id,
+				username: users.username,
+				isAdmin: users.isAdmin,
+			})
+			.from(users)
+			.orderBy(asc(users.username));
+
+		return json({
+			users: rows.map((row) => ({
+				id: row.id,
+				username: row.username,
+				isAdmin: Boolean(row.isAdmin),
+			})),
+		});
+	} catch (error) {
+		return errorJson(
+			"admin-list-users",
+			500,
+			"Failed to load users",
+			error.message,
+		);
+	}
+}
+
+async function handleAdminImpersonate(request, env) {
+	try {
+		const authResult = await getAuthenticatedUserFromRequest(request, env);
+		if (authResult.errorResponse) {
+			return authResult.errorResponse;
+		}
+
+		const { db, session, user } = authResult;
+		if (!user.isAdmin) {
+			return errorJson(
+				"admin-impersonate",
+				403,
+				"Forbidden",
+				"Admin privileges required",
+				{ username: user.username },
+			);
+		}
+
+		const body = await request.json();
+		const userId = Number(body?.userId);
+		if (!Number.isInteger(userId) || userId <= 0) {
+			return errorJson(
+				"admin-impersonate",
+				400,
+				"Invalid payload",
+				"userId must be a positive integer",
+			);
+		}
+
+		const matchedUsers = await db
+			.select({
+				id: users.id,
+				username: users.username,
+				uniqueCode: users.uniqueCode,
+				isAdmin: users.isAdmin,
+			})
+			.from(users)
+			.where(eq(users.id, userId))
+			.limit(1);
+
+		const targetUser = matchedUsers[0];
+		if (!targetUser) {
+			return errorJson(
+				"admin-impersonate",
+				404,
+				"User not found",
+				"The selected user does not exist",
+				{ requestedUserId: userId },
+			);
+		}
+
+		const newSessionId = await createSessionForUser(targetUser, db);
+		await deleteSessionById(session.id, env);
+
+		return withSessionCookie(
+			{
+				message: `Now logged in as ${targetUser.username}`,
+				...buildAuthResponse(
+					{ userId: targetUser.id, username: targetUser.username },
+					targetUser,
+				),
+			},
+			newSessionId,
+		);
+	} catch (error) {
+		return errorJson(
+			"admin-impersonate",
+			500,
+			"Failed to impersonate user",
+			error.message,
+		);
+	}
+}
+
+async function handleAdminAuthorization(request, env) {
+	const authResult = await getAuthenticatedUserFromRequest(request, env);
+	if (authResult.errorResponse) {
+		return authResult.errorResponse;
+	}
+
+	if (!authResult.user.isAdmin) {
+		return errorJson(
+			"admin-authz",
+			403,
+			"Forbidden",
+			"Admin privileges required",
+			{ username: authResult.user.username },
+		);
+	}
+
+	return null;
 }
 app.get("/", (_req, res) => {
 	res.json({ message: "Express.js running on Cloudflare Workers!" });
 });
 
-app.post(
-	"/api/auth/register",
-	routeHandler((request) => handleRegister(request, env)),
-);
-app.post(
-	"/api/auth/login",
-	routeHandler((request) => handleLogin(request, env)),
-);
-app.post(
-	"/api/auth/logout",
-	routeHandler((request) => handleLogout(request, env)),
-);
-app.get(
-	"/api/auth/me",
-	routeHandler((request) => handleAuthMe(request, env)),
-);
-app.post(
-	"/api/auth/forgot-password-hash",
-	routeHandler((request) => handleForgotPasswordHash(request, env)),
-);
-app.post(
-	"/api/record-attendance",
-	routeHandler((request) => handleRecordAttendance(env, request)),
-);
-app.post(
-	"/api/attendance/toggle",
-	routeHandler((request) => handleToggleAttendanceByDate(request, env)),
-);
-app.get(
-	"/api/attendance",
-	routeHandler((request) => handleAttendanceByMonth(request, env)),
-);
-app.post(
-	"/api/stats/preview",
-	routeHandler((request) => handlePreviewStats(request)),
-);
-app.get(
-	"/api/stats",
-	routeHandler((request) => handleStats(request, env)),
-);
+app.post("/api/auth/register", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleRegister(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.post("/api/auth/login", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleLogin(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.post("/api/auth/logout", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleLogout(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.get("/api/auth/me", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleAuthMe(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.post("/api/auth/forgot-password-hash", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleForgotPasswordHash(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.use("/api/admin", async (req, res, next) => {
+	const request = createWorkerRequestFromExpress(req);
+	const response = await handleAdminAuthorization(request, env);
+	if (response) {
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+		return;
+	}
+
+	next();
+});
+app.get("/api/admin/list-users", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleAdminListUsers(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.post("/api/admin/impersonate", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleAdminImpersonate(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.post("/api/record-attendance", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleRecordAttendance(env, request);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.post("/api/attendance/toggle", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleToggleAttendanceByDate(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.get("/api/attendance", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleAttendanceByMonth(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.post("/api/stats/preview", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handlePreviewStats(request);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
+app.get("/api/stats", async (req, res) => {
+	try {
+		const request = createWorkerRequestFromExpress(req);
+		const response = await handleStats(request, env);
+		await logWorkerErrorResponseIfNeeded(req, response);
+		await sendWorkerResponseToExpress(res, response);
+	} catch (error) {
+		sendUnhandledRouteError(res, error);
+	}
+});
 
 app.use("/api", (_req, res) => {
+	console.error("[api] Not Found", JSON.stringify({ path: _req.originalUrl }));
 	res.status(404).json({ error: "Not Found" });
 });
 

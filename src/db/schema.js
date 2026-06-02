@@ -13,6 +13,7 @@ const users = sqliteTable(
 		username: text("username").notNull(),
 		password: text("password").notNull(),
 		uniqueCode: text("unique_code").notNull(),
+		isAdmin: integer("is_admin", { mode: "boolean" }).notNull().default(false),
 	},
 	(table) => [
 		uniqueIndex("users_username_unique").on(table.username),
