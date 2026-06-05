@@ -1139,12 +1139,7 @@ app.post(
 			);
 		}
 
-		const db = getDbForEnv(env);
-		const attendedDateStrings = await fetchAttendedDateStrings(
-			db,
-			session.userId,
-		);
-		const stats = calculateBeltStats(attendedDateStrings, requestedDates);
+		const stats = calculateBeltStats(requestedDates);
 		return json(stats);
 	}),
 	sendWorkerResponseMiddleware,

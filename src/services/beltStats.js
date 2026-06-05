@@ -343,60 +343,54 @@ async function fetchAttendedDateStrings(db, userId, now = new Date()) {
 
 /**
  * @param {string[]} dates
- * @param {string[] | null} [previewDates]
  * @returns {BeltStatsResult}
  */
-function calculateBeltStats(dates, previewDates = null) {
+function calculateBeltStats(dates) {
 	const now = new Date();
 	const today = utcPlus7DateOnly(now);
 	const todayIso = formatIsoDate(today);
 	const normalizedAttendedDateStrings = [...new Set(dates ?? [])].sort(
 		(left, right) => left.localeCompare(right),
 	);
-	const normalizedPreviewDateStrings = Array.isArray(previewDates)
-		? [...new Set(previewDates)].sort((left, right) =>
-				left.localeCompare(right),
-			)
-		: normalizedAttendedDateStrings;
-	const attendedDateSet = new Set(normalizedPreviewDateStrings);
+	const attendedDateSet = new Set(normalizedAttendedDateStrings);
 	const latestSelectedIso =
-		normalizedPreviewDateStrings[normalizedPreviewDateStrings.length - 1] ??
+		normalizedAttendedDateStrings[normalizedAttendedDateStrings.length - 1] ??
 		todayIso;
 	const latestSelectedDate = parseIsoDate(latestSelectedIso);
 	const beltStatAsOfDate =
 		latestSelectedDate > today ? latestSelectedDate : today;
 
 	const current = calculateBeltStat(
-		normalizedPreviewDateStrings,
+		normalizedAttendedDateStrings,
 		beltStatAsOfDate,
 	);
 	const currentMonthAttendance = calculateCurrentMonthAttendance(
-		normalizedPreviewDateStrings,
+		normalizedAttendedDateStrings,
 		today,
 	);
 	const currentMonthAttendanceDates = getCurrentMonthAttendanceDateStrings(
-		normalizedPreviewDateStrings,
+		normalizedAttendedDateStrings,
 		today,
 	);
 	const maxIfTodayAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedPreviewDateStrings,
+		attendedDateStrings: normalizedAttendedDateStrings,
 		today,
 		todayAttended: true,
 	});
 	const maxIfTodayNotAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedPreviewDateStrings,
+		attendedDateStrings: normalizedAttendedDateStrings,
 		today,
 		todayAttended: false,
 	});
 	const deltaComparisonStartDate = nextWeekday(addDays(today, 1));
 	const deltaIfTodayAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedPreviewDateStrings,
+		attendedDateStrings: normalizedAttendedDateStrings,
 		today,
 		todayAttended: true,
 		startDateOverride: deltaComparisonStartDate,
 	});
 	const deltaIfTodayNotAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedPreviewDateStrings,
+		attendedDateStrings: normalizedAttendedDateStrings,
 		today,
 		todayAttended: false,
 		startDateOverride: deltaComparisonStartDate,
@@ -411,7 +405,7 @@ function calculateBeltStats(dates, previewDates = null) {
 	const todayWasAttended = attendedDateSet.has(todayIso);
 
 	return {
-		attendedDateStrings: normalizedPreviewDateStrings,
+		attendedDateStrings: normalizedAttendedDateStrings,
 		currentBeltStat: Number(current.average.toFixed(3)),
 		sumBestEight: current.sumBestEight,
 		currentMonthAttendance,
