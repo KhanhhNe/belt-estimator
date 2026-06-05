@@ -2,9 +2,7 @@ const { and, asc, eq, gte, lte } = require("drizzle-orm");
 const { attendanceRecords } = require("../db/schema");
 
 const TOTAL_WEEKS = 12;
-const BEST_WEEKS_COUNT = 8;
 const COMPLIANCE_THRESHOLD = 3;
-const MAX_SIMULATION_DAYS = 365;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 /**
@@ -15,44 +13,12 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
  */
 
 /**
- * @typedef {object} BeltWeekStat
- * @property {number[]} weeklyCounts
- * @property {number[]} selectedCounts
- * @property {number} sumBestEight
- * @property {number} currentWeekAttendance
- * @property {number} average
- * @property {boolean} isCompliant
- */
-
-/**
- * @typedef {object} BeltStatsMetadata
- * @property {number} windowWeeks
- * @property {number} bestWeeksUsed
- * @property {boolean} currentWeekIncluded
- * @property {string} beltStatAsOfDate
- * @property {number} currentWeekAttendance
- * @property {string} wfhStartDateIfTodayAttended
- * @property {string} wfhStartDateIfTodayNotAttended
- * @property {string} deltaComparisonStartDate
- * @property {number} complianceThreshold
- * @property {boolean} todayWasAttended
- */
-
-/**
  * @typedef {object} BeltStatsResult
  * @property {string[]} attendedDateStrings
  * @property {number} currentBeltStat
  * @property {string} currentDate
  * @property {number} maximumConsecutiveWfhDays
  * @property {number} nextDayAttendanceStatChange
- */
-
-/**
- * @typedef {object} WfhSimulationOptions
- * @property {string[]} attendedDateStrings
- * @property {Date} today
- * @property {boolean} todayAttended
- * @property {Date | null} [startDateOverride]
  */
 
 /**
@@ -100,11 +66,6 @@ function addDays(date, days) {
 	return next;
 }
 
-function isWeekday(date) {
-	const day = date.getUTCDay();
-	return day >= 1 && day <= 5;
-}
-
 function startOfWeekMonday(date) {
 	const start = utcDateOnly(date);
 	const dayOffset = (start.getUTCDay() + 6) % 7;
@@ -136,179 +97,6 @@ function getFetchWindowStartDate(now) {
 function getFetchWindowEndDate(now) {
 	const { currentWeekEnd } = getUtcPlus7WeekBounds(now);
 	return currentWeekEnd;
-}
-
-/**
- * @param {Date[]} attendedDates
- * @param {Date} asOfDate
- * @returns {number[]}
- */
-function getWeeklyAttendanceCounts(attendedDates, asOfDate) {
-	const asOf = utcDateOnly(asOfDate);
-	// Week index 0 is always the current week (Mon-Sun), so trailing 12 weeks includes this week.
-	const currentWeekStart = startOfWeekMonday(asOf);
-
-	const weeklyCounts = [];
-
-	for (let weekIndex = 0; weekIndex < TOTAL_WEEKS; weekIndex += 1) {
-		const weekStart = addDays(currentWeekStart, -weekIndex * 7);
-		const weekEnd = addDays(weekStart, 6);
-		const cappedWeekEnd = weekEnd < asOf ? weekEnd : asOf;
-
-		let count = 0;
-		for (const attendedDate of attendedDates) {
-			if (attendedDate < weekStart || attendedDate > cappedWeekEnd) {
-				continue;
-			}
-
-			if (isWeekday(attendedDate)) {
-				count += 1;
-			}
-		}
-
-		weeklyCounts.push(count);
-	}
-
-	return weeklyCounts;
-}
-
-/**
- * @param {string[]} attendedDateStrings
- * @param {Date} asOfDate
- * @returns {BeltWeekStat}
- */
-function calculateBeltStat(attendedDateStrings, asOfDate) {
-	const uniqueDateStrings = [...new Set(attendedDateStrings)];
-	const attendedDates = uniqueDateStrings.map(parseIsoDate);
-	const weeklyCounts = getWeeklyAttendanceCounts(attendedDates, asOfDate);
-	const selectedCounts = [...weeklyCounts]
-		.sort((a, b) => b - a)
-		.slice(0, BEST_WEEKS_COUNT);
-
-	const total = selectedCounts.reduce((sum, value) => sum + value, 0);
-	const average = total / BEST_WEEKS_COUNT;
-
-	return {
-		weeklyCounts,
-		selectedCounts,
-		sumBestEight: total,
-		currentWeekAttendance: weeklyCounts[0] ?? 0,
-		average,
-		isCompliant: average >= COMPLIANCE_THRESHOLD,
-	};
-}
-
-/**
- * @param {string[]} attendedDateStrings
- * @param {Date} asOfDate
- * @returns {number}
- */
-function calculateCurrentMonthAttendance(attendedDateStrings, asOfDate) {
-	const asOf = utcDateOnly(asOfDate);
-	const year = asOf.getUTCFullYear();
-	const month = asOf.getUTCMonth();
-	const uniqueDateStrings = [...new Set(attendedDateStrings)];
-
-	let attendanceCount = 0;
-	for (const dateString of uniqueDateStrings) {
-		const date = parseIsoDate(dateString);
-		if (date > asOf) {
-			continue;
-		}
-
-		if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month) {
-			continue;
-		}
-
-		if (isWeekday(date)) {
-			attendanceCount += 1;
-		}
-	}
-
-	return attendanceCount;
-}
-
-/**
- * @param {string[]} attendedDateStrings
- * @param {Date} asOfDate
- * @returns {string[]}
- */
-function getCurrentMonthAttendanceDateStrings(attendedDateStrings, asOfDate) {
-	const asOf = utcDateOnly(asOfDate);
-	const year = asOf.getUTCFullYear();
-	const month = asOf.getUTCMonth();
-	const uniqueDateStrings = [...new Set(attendedDateStrings)];
-
-	return uniqueDateStrings
-		.filter((dateString) => {
-			const date = parseIsoDate(dateString);
-			if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month) {
-				return false;
-			}
-
-			return true;
-		})
-		.sort((left, right) => left.localeCompare(right));
-}
-
-function nextWeekday(date) {
-	let cursor = utcDateOnly(date);
-	while (!isWeekday(cursor)) {
-		cursor = addDays(cursor, 1);
-	}
-	return cursor;
-}
-
-function getWfhStartDate(today, todayAttended) {
-	// Rule:
-	// - If today is attended, consecutive WFH counting starts from tomorrow.
-	// - If today is not attended, consecutive WFH counting starts from today.
-	const baseDate = todayAttended ? addDays(today, 1) : utcDateOnly(today);
-	return nextWeekday(baseDate);
-}
-
-/**
- * @param {WfhSimulationOptions} options
- * @returns {number}
- */
-function computeMaximumConsecutiveWfhDays({
-	attendedDateStrings,
-	today,
-	todayAttended,
-	startDateOverride = null,
-}) {
-	const scenarioDates = new Set(attendedDateStrings);
-	const todayIso = formatIsoDate(today);
-
-	if (todayAttended) {
-		scenarioDates.add(todayIso);
-	} else {
-		scenarioDates.delete(todayIso);
-	}
-
-	const firstWfhDate = startDateOverride
-		? nextWeekday(startDateOverride)
-		: getWfhStartDate(today, todayAttended);
-
-	let maxAllowed = 0;
-	let weekdayWfhCount = 0;
-
-	for (let dayOffset = 0; dayOffset < MAX_SIMULATION_DAYS; dayOffset += 1) {
-		const cursor = addDays(firstWfhDate, dayOffset);
-		if (!isWeekday(cursor)) {
-			continue;
-		}
-
-		weekdayWfhCount += 1;
-		const projected = calculateBeltStat([...scenarioDates], cursor);
-		if (!projected.isCompliant) {
-			break;
-		}
-
-		maxAllowed = weekdayWfhCount;
-	}
-
-	return maxAllowed;
 }
 
 /**

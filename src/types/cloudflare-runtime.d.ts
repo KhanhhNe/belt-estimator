@@ -9,8 +9,7 @@ declare module "cloudflare:workers" {
 		ASSETS?: {
 			fetch: (request: Request) => Promise<Response> | Response;
 		};
-		TURSO_DATABASE_URL?: string;
-		TURSO_AUTH_TOKEN?: string;
+		belt_estimator?: import("@cloudflare/workers-types").D1Database;
 		PASSWORD_HASH_SECRET?: string;
 		[key: string]: unknown;
 	};

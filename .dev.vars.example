@@ -1,2 +1,2 @@
-TURSO_DATABASE_URL=libsql://your-database-name.turso.io
-TURSO_AUTH_TOKEN=your-turso-auth-token
+# No local variables required for D1 when wrangler.jsonc sets
+# d1_databases[].remote = true.

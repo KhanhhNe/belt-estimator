@@ -1,9 +1,8 @@
 import { httpServerHandler } from "cloudflare:node";
 import { env } from "cloudflare:workers";
-import { createClient } from "@libsql/client/web";
 import bcrypt from "bcryptjs";
 import { and, asc, eq, gte, lt } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/libsql";
+import { drizzle } from "drizzle-orm/d1";
 import express from "express";
 import schema from "./db/schema.js";
 import beltStats from "./services/beltStats.js";
@@ -18,7 +17,6 @@ const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const SESSION_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
 
 let cachedDb = null;
-let cachedCredentialsKey = null;
 const SESSION_COOKIE_NAME = "belt_sid";
 
 const app = express();
@@ -472,26 +470,12 @@ async function generateUniqueCode(db) {
 }
 
 function getDbForEnv(env) {
-	const credentials = {
-		TURSO_DATABASE_URL: env.TURSO_DATABASE_URL,
-		TURSO_AUTH_TOKEN: env.TURSO_AUTH_TOKEN,
-	};
-
-	if (!credentials.TURSO_DATABASE_URL || !credentials.TURSO_AUTH_TOKEN) {
-		throw new Error(
-			"Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN in Worker environment",
-		);
+	if (!env?.belt_estimator) {
+		throw new Error("Missing D1 binding belt_estimator in Worker environment");
 	}
 
-	const credentialsKey = `${credentials.TURSO_DATABASE_URL}|${credentials.TURSO_AUTH_TOKEN}`;
-
-	if (!cachedDb || cachedCredentialsKey !== credentialsKey) {
-		const client = createClient({
-			url: credentials.TURSO_DATABASE_URL,
-			authToken: credentials.TURSO_AUTH_TOKEN,
-		});
-		cachedDb = drizzle({ client });
-		cachedCredentialsKey = credentialsKey;
+	if (!cachedDb) {
+		cachedDb = drizzle(env.belt_estimator);
 	}
 
 	return cachedDb;

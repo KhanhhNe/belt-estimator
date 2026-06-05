@@ -14,20 +14,16 @@ npm install
 
 ## Environment
 
-Create a `.env` file from `.env.example` and fill in your Turso credentials.
+Create a `.env` file from `.env.example`.
 
 Required keys:
 
-- `TURSO_DATABASE_URL`
-- `TURSO_AUTH_TOKEN`
 - `PASSWORD_HASH_SECRET`
 
 For local Cloudflare Worker development, create `.dev.vars` from `.dev.vars.example`.
 
-Required keys:
-
-- `TURSO_DATABASE_URL`
-- `TURSO_AUTH_TOKEN`
+No local D1 credentials are required when `wrangler.jsonc` has
+`d1_databases[].remote = true`.
 
 ## Run (local Worker)
 
@@ -50,8 +46,7 @@ npx wrangler login
 2. Set Worker secrets in Cloudflare:
 
 ```bash
-npm run cf:secret:url
-npm run cf:secret:token
+npx wrangler secret put PASSWORD_HASH_SECRET
 ```
 
 3. Run Worker locally:
@@ -80,4 +75,12 @@ npm run db:push
 npm run db:generate
 npm run db:migrate
 npm run db:studio
+```
+
+## D1 migrations (Cloudflare)
+
+Apply all SQL files in `drizzle/` to remote D1:
+
+```bash
+Get-ChildItem -Path drizzle -Filter *.sql | Sort-Object Name | ForEach-Object { npx wrangler d1 execute belt-estimator --remote --file "$($_.FullName)" --yes }
 ```
