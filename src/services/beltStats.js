@@ -1,17 +1,83 @@
-const { and, asc, eq, gte } = require("drizzle-orm");
+const { and, asc, eq, gte, lte } = require("drizzle-orm");
 const { attendanceRecords } = require("../db/schema");
 
 const TOTAL_WEEKS = 12;
 const BEST_WEEKS_COUNT = 8;
 const COMPLIANCE_THRESHOLD = 3;
 const MAX_SIMULATION_DAYS = 365;
-const FETCH_WEEKS = TOTAL_WEEKS + 1;
 
+/**
+ * @typedef {object} WeekBounds
+ * @property {Date} today
+ * @property {Date} currentWeekStart
+ * @property {Date} currentWeekEnd
+ */
+
+/**
+ * @typedef {object} BeltWeekStat
+ * @property {number[]} weeklyCounts
+ * @property {number[]} selectedCounts
+ * @property {number} sumBestEight
+ * @property {number} currentWeekAttendance
+ * @property {number} average
+ * @property {boolean} isCompliant
+ */
+
+/**
+ * @typedef {object} BeltStatsMetadata
+ * @property {number} windowWeeks
+ * @property {number} bestWeeksUsed
+ * @property {boolean} currentWeekIncluded
+ * @property {string} beltStatAsOfDate
+ * @property {number} currentWeekAttendance
+ * @property {number[]} bestEightBreakdown
+ * @property {number[]} trailingTwelveBreakdown
+ * @property {string} wfhStartDateIfTodayAttended
+ * @property {string} wfhStartDateIfTodayNotAttended
+ * @property {string} deltaComparisonStartDate
+ * @property {number} complianceThreshold
+ * @property {boolean} todayWasAttended
+ */
+
+/**
+ * @typedef {object} BeltStatsResult
+ * @property {string[]} attendedDateStrings
+ * @property {number} currentBeltStat
+ * @property {number} sumBestEight
+ * @property {number} currentMonthAttendance
+ * @property {string[]} currentMonthAttendanceDates
+ * @property {string} currentDate
+ * @property {number} maximumConsecutiveWfhDays
+ * @property {number} nextDayAttendanceStatChange
+ * @property {BeltStatsMetadata} metadata
+ */
+
+/**
+ * @typedef {object} WfhSimulationOptions
+ * @property {string[]} attendedDateStrings
+ * @property {Date} today
+ * @property {boolean} todayAttended
+ * @property {Date | null} [startDateOverride]
+ */
+
+/**
+ * @typedef {object} AttendanceDateRow
+ * @property {string} date
+ */
+
+/**
+ * @param {string} dateString
+ * @returns {Date}
+ */
 function parseIsoDate(dateString) {
 	const [year, month, day] = dateString.split("-").map(Number);
 	return new Date(Date.UTC(year, month - 1, day));
 }
 
+/**
+ * @param {Date} date
+ * @returns {string}
+ */
 function formatIsoDate(date) {
 	return date.toISOString().slice(0, 10);
 }
@@ -51,12 +117,37 @@ function startOfWeekMonday(date) {
 	return start;
 }
 
-function getFetchWindowStartDate(now) {
+/**
+ * @param {Date} [now]
+ * @returns {WeekBounds}
+ */
+function getUtcPlus7WeekBounds(now = new Date()) {
 	const today = utcPlus7DateOnly(now);
 	const currentWeekStart = startOfWeekMonday(today);
-	return addDays(currentWeekStart, -(FETCH_WEEKS - 1) * 7);
+	const currentWeekEnd = addDays(currentWeekStart, 6);
+
+	return {
+		today,
+		currentWeekStart,
+		currentWeekEnd,
+	};
 }
 
+function getFetchWindowStartDate(now) {
+	const { currentWeekStart } = getUtcPlus7WeekBounds(now);
+	return addDays(currentWeekStart, -(TOTAL_WEEKS - 1) * 7);
+}
+
+function getFetchWindowEndDate(now) {
+	const { currentWeekEnd } = getUtcPlus7WeekBounds(now);
+	return currentWeekEnd;
+}
+
+/**
+ * @param {Date[]} attendedDates
+ * @param {Date} asOfDate
+ * @returns {number[]}
+ */
 function getWeeklyAttendanceCounts(attendedDates, asOfDate) {
 	const asOf = utcDateOnly(asOfDate);
 	// Week index 0 is always the current week (Mon-Sun), so trailing 12 weeks includes this week.
@@ -86,6 +177,11 @@ function getWeeklyAttendanceCounts(attendedDates, asOfDate) {
 	return weeklyCounts;
 }
 
+/**
+ * @param {string[]} attendedDateStrings
+ * @param {Date} asOfDate
+ * @returns {BeltWeekStat}
+ */
 function calculateBeltStat(attendedDateStrings, asOfDate) {
 	const uniqueDateStrings = [...new Set(attendedDateStrings)];
 	const attendedDates = uniqueDateStrings.map(parseIsoDate);
@@ -107,6 +203,11 @@ function calculateBeltStat(attendedDateStrings, asOfDate) {
 	};
 }
 
+/**
+ * @param {string[]} attendedDateStrings
+ * @param {Date} asOfDate
+ * @returns {number}
+ */
 function calculateCurrentMonthAttendance(attendedDateStrings, asOfDate) {
 	const asOf = utcDateOnly(asOfDate);
 	const year = asOf.getUTCFullYear();
@@ -132,6 +233,11 @@ function calculateCurrentMonthAttendance(attendedDateStrings, asOfDate) {
 	return attendanceCount;
 }
 
+/**
+ * @param {string[]} attendedDateStrings
+ * @param {Date} asOfDate
+ * @returns {string[]}
+ */
 function getCurrentMonthAttendanceDateStrings(attendedDateStrings, asOfDate) {
 	const asOf = utcDateOnly(asOfDate);
 	const year = asOf.getUTCFullYear();
@@ -166,6 +272,10 @@ function getWfhStartDate(today, todayAttended) {
 	return nextWeekday(baseDate);
 }
 
+/**
+ * @param {WfhSimulationOptions} options
+ * @returns {number}
+ */
 function computeMaximumConsecutiveWfhDays({
 	attendedDateStrings,
 	today,
@@ -206,8 +316,15 @@ function computeMaximumConsecutiveWfhDays({
 	return maxAllowed;
 }
 
+/**
+ * @param {import("drizzle-orm/libsql").LibSQLDatabase} db
+ * @param {number} userId
+ * @param {Date} [now]
+ * @returns {Promise<string[]>}
+ */
 async function fetchAttendedDateStrings(db, userId, now = new Date()) {
 	const windowStartDate = formatIsoDate(getFetchWindowStartDate(now));
+	const windowEndDate = formatIsoDate(getFetchWindowEndDate(now));
 
 	const rows = await db
 		.selectDistinct({ date: attendanceRecords.date })
@@ -216,61 +333,70 @@ async function fetchAttendedDateStrings(db, userId, now = new Date()) {
 			and(
 				eq(attendanceRecords.userId, userId),
 				gte(attendanceRecords.date, windowStartDate),
+				lte(attendanceRecords.date, windowEndDate),
 			),
 		)
 		.orderBy(asc(attendanceRecords.date));
 
-	return rows.map((row) => row.date);
+	return rows.map(/** @param {AttendanceDateRow} row */ (row) => row.date);
 }
 
-function getBeltStatsFromAttendedDateStrings(
-	attendedDateStrings,
-	now = new Date(),
-) {
+/**
+ * @param {string[]} dates
+ * @param {string[] | null} [previewDates]
+ * @returns {BeltStatsResult}
+ */
+function calculateBeltStats(dates, previewDates = null) {
+	const now = new Date();
 	const today = utcPlus7DateOnly(now);
 	const todayIso = formatIsoDate(today);
-	const normalizedAttendedDateStrings = [...new Set(attendedDateStrings)].sort(
+	const normalizedAttendedDateStrings = [...new Set(dates ?? [])].sort(
 		(left, right) => left.localeCompare(right),
 	);
-	const attendedDateSet = new Set(normalizedAttendedDateStrings);
+	const normalizedPreviewDateStrings = Array.isArray(previewDates)
+		? [...new Set(previewDates)].sort((left, right) =>
+				left.localeCompare(right),
+			)
+		: normalizedAttendedDateStrings;
+	const attendedDateSet = new Set(normalizedPreviewDateStrings);
 	const latestSelectedIso =
-		normalizedAttendedDateStrings[normalizedAttendedDateStrings.length - 1] ??
+		normalizedPreviewDateStrings[normalizedPreviewDateStrings.length - 1] ??
 		todayIso;
 	const latestSelectedDate = parseIsoDate(latestSelectedIso);
 	const beltStatAsOfDate =
 		latestSelectedDate > today ? latestSelectedDate : today;
 
 	const current = calculateBeltStat(
-		normalizedAttendedDateStrings,
+		normalizedPreviewDateStrings,
 		beltStatAsOfDate,
 	);
 	const currentMonthAttendance = calculateCurrentMonthAttendance(
-		normalizedAttendedDateStrings,
+		normalizedPreviewDateStrings,
 		today,
 	);
 	const currentMonthAttendanceDates = getCurrentMonthAttendanceDateStrings(
-		normalizedAttendedDateStrings,
+		normalizedPreviewDateStrings,
 		today,
 	);
 	const maxIfTodayAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedAttendedDateStrings,
+		attendedDateStrings: normalizedPreviewDateStrings,
 		today,
 		todayAttended: true,
 	});
 	const maxIfTodayNotAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedAttendedDateStrings,
+		attendedDateStrings: normalizedPreviewDateStrings,
 		today,
 		todayAttended: false,
 	});
 	const deltaComparisonStartDate = nextWeekday(addDays(today, 1));
 	const deltaIfTodayAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedAttendedDateStrings,
+		attendedDateStrings: normalizedPreviewDateStrings,
 		today,
 		todayAttended: true,
 		startDateOverride: deltaComparisonStartDate,
 	});
 	const deltaIfTodayNotAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedAttendedDateStrings,
+		attendedDateStrings: normalizedPreviewDateStrings,
 		today,
 		todayAttended: false,
 		startDateOverride: deltaComparisonStartDate,
@@ -285,7 +411,7 @@ function getBeltStatsFromAttendedDateStrings(
 	const todayWasAttended = attendedDateSet.has(todayIso);
 
 	return {
-		attendedDateStrings: normalizedAttendedDateStrings,
+		attendedDateStrings: normalizedPreviewDateStrings,
 		currentBeltStat: Number(current.average.toFixed(3)),
 		sumBestEight: current.sumBestEight,
 		currentMonthAttendance,
@@ -312,12 +438,7 @@ function getBeltStatsFromAttendedDateStrings(
 	};
 }
 
-async function getBeltStats(db, userId, now = new Date()) {
-	const attendedDateStrings = await fetchAttendedDateStrings(db, userId, now);
-	return getBeltStatsFromAttendedDateStrings(attendedDateStrings, now);
-}
-
 module.exports = {
-	getBeltStats,
-	getBeltStatsFromAttendedDateStrings,
+	calculateBeltStats,
+	fetchAttendedDateStrings,
 };

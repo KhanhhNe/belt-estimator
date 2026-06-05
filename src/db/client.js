@@ -1,6 +1,29 @@
 const { createClient } = require("@libsql/client");
 const { drizzle } = require("drizzle-orm/libsql");
 
+/**
+ * @typedef {object} DatabaseCredentials
+ * @property {string} url
+ * @property {string} authToken
+ */
+
+/**
+ * @typedef {NodeJS.ProcessEnv & {
+ * 	TURSO_DATABASE_URL?: string;
+ * 	TURSO_AUTH_TOKEN?: string;
+ * }} EnvLike
+ */
+
+/**
+ * @typedef {object} DbClientBundle
+ * @property {import("@libsql/client").Client} client
+ * @property {import("drizzle-orm/libsql").LibSQLDatabase} db
+ */
+
+/**
+ * @param {EnvLike} [env]
+ * @returns {DatabaseCredentials}
+ */
 function getDatabaseCredentials(env = process.env) {
 	const url = env.TURSO_DATABASE_URL;
 	const authToken = env.TURSO_AUTH_TOKEN;
@@ -14,6 +37,10 @@ function getDatabaseCredentials(env = process.env) {
 	return { url, authToken };
 }
 
+/**
+ * @param {DatabaseCredentials} params
+ * @returns {DbClientBundle}
+ */
 function createDbClient({ url, authToken }) {
 	const client = createClient({
 		url,
@@ -25,6 +52,10 @@ function createDbClient({ url, authToken }) {
 	return { client, db };
 }
 
+/**
+ * @param {EnvLike} [env]
+ * @returns {DbClientBundle}
+ */
 function getDbFromEnv(env = process.env) {
 	const credentials = getDatabaseCredentials(env);
 	return createDbClient(credentials);

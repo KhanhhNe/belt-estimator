@@ -9,7 +9,7 @@ import schema from "./db/schema.js";
 import beltStats from "./services/beltStats.js";
 
 const { attendanceRecords, sessions, users } = schema;
-const { getBeltStats, getBeltStatsFromAttendedDateStrings } = beltStats;
+const { calculateBeltStats, fetchAttendedDateStrings } = beltStats;
 const UNIQUE_CODE_LENGTH = 8;
 const UNIQUE_CODE_CHARSET =
 	"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -40,7 +40,7 @@ const API_DOCS = {
 	attendanceByMonth:
 		"GET /api/attendance?month=MM/YY returns attendance dates for the authenticated session user in that month.",
 	previewStats:
-		"POST /api/stats/preview accepts attendedDateStrings (array of YYYY-MM-DD) and returns recomputed BELT stats without writing to database.",
+		"POST /api/stats/preview requires an authenticated session, accepts attendedDateStrings (array of YYYY-MM-DD), and returns recomputed BELT stats without writing to database.",
 	stats:
 		"GET /api/stats requires an authenticated session and returns stats for the current session user.",
 };
@@ -1104,6 +1104,16 @@ app.post(
 	"/api/stats/preview",
 	runWorkerHandler(async (req) => {
 		const request = req.workerRequest;
+		const session = await getSessionFromRequest(request, env);
+		if (!session) {
+			return errorJson(
+				"stats-preview",
+				401,
+				"Authentication required",
+				"Log in to access this endpoint",
+			);
+		}
+
 		const body = await request.json();
 		const requestedDates = body?.attendedDateStrings;
 
@@ -1129,7 +1139,12 @@ app.post(
 			);
 		}
 
-		const stats = getBeltStatsFromAttendedDateStrings(requestedDates);
+		const db = getDbForEnv(env);
+		const attendedDateStrings = await fetchAttendedDateStrings(
+			db,
+			session.userId,
+		);
+		const stats = calculateBeltStats(attendedDateStrings, requestedDates);
 		return json(stats);
 	}),
 	sendWorkerResponseMiddleware,
@@ -1149,7 +1164,11 @@ app.get(
 		}
 
 		const db = getDbForEnv(env);
-		const stats = await getBeltStats(db, session.userId);
+		const attendedDateStrings = await fetchAttendedDateStrings(
+			db,
+			session.userId,
+		);
+		const stats = calculateBeltStats(attendedDateStrings);
 		return json(
 			{
 				_docs: API_DOCS,
