@@ -5,6 +5,7 @@ const TOTAL_WEEKS = 12;
 const BEST_WEEKS_COUNT = 8;
 const COMPLIANCE_THRESHOLD = 3;
 const MAX_SIMULATION_DAYS = 365;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 /**
  * @typedef {object} WeekBounds
@@ -30,8 +31,6 @@ const MAX_SIMULATION_DAYS = 365;
  * @property {boolean} currentWeekIncluded
  * @property {string} beltStatAsOfDate
  * @property {number} currentWeekAttendance
- * @property {number[]} bestEightBreakdown
- * @property {number[]} trailingTwelveBreakdown
  * @property {string} wfhStartDateIfTodayAttended
  * @property {string} wfhStartDateIfTodayNotAttended
  * @property {string} deltaComparisonStartDate
@@ -43,13 +42,9 @@ const MAX_SIMULATION_DAYS = 365;
  * @typedef {object} BeltStatsResult
  * @property {string[]} attendedDateStrings
  * @property {number} currentBeltStat
- * @property {number} sumBestEight
- * @property {number} currentMonthAttendance
- * @property {string[]} currentMonthAttendanceDates
  * @property {string} currentDate
  * @property {number} maximumConsecutiveWfhDays
  * @property {number} nextDayAttendanceStatChange
- * @property {BeltStatsMetadata} metadata
  */
 
 /**
@@ -342,94 +337,178 @@ async function fetchAttendedDateStrings(db, userId, now = new Date()) {
 }
 
 /**
+ * @param {Date} date
+ * @returns {Date}
+ */
+function startOfWeek(date) {
+	if (date.getUTCDay() === 0) {
+		// Sunday should be treated as the end of the week, so subtract 6 days to get to Monday.
+		const res = addDays(date, -6);
+		res.setUTCHours(0, 0, 0, 0);
+		return res;
+	}
+
+	// For other days, subtract the appropriate number of days to get to Monday.
+	const res = addDays(date, -(date.getUTCDay() - 1));
+	res.setUTCHours(0, 0, 0, 0);
+	return res;
+}
+
+/**
+ * @typedef {object} BeltStatFromWeeksResult
+ * @property {number} belt
+ * @property {number} totalWeeks
+ */
+
+/**
+ *
+ * @param {number[]} weeklyCounts
+ * @returns {BeltStatFromWeeksResult}
+ */
+function calculateStatsFromWeeks(
+	weeklyCounts,
+	from = 0,
+	to = weeklyCounts.length,
+) {
+	const beltVals = Array(8).fill(0);
+	for (let i = from; i < to; i++) {
+		const count = weeklyCounts[i] ?? 0;
+		if (count > 0 && count <= 8) {
+			beltVals[count] += 1;
+		}
+	}
+
+	let weekCount = 8,
+		ind = beltVals.length - 1,
+		totalWeeks = 0,
+		sumBestEight = 0;
+	while (weekCount > 0 && ind > 0) {
+		if (beltVals[ind] === 0) {
+			ind -= 1;
+			continue;
+		}
+
+		const deduct = Math.min(weekCount, beltVals[ind]);
+		sumBestEight += deduct * ind;
+
+		weekCount -= deduct;
+		ind -= 1;
+		totalWeeks += deduct;
+	}
+
+	return {
+		belt: sumBestEight / totalWeeks,
+		totalWeeks,
+	};
+}
+
+/**
+ *
+ * @param {number[]} calcWeeks
+ * @returns {number}
+ */
+function calculateAdditionalWfhDays(calcWeeks) {
+	let wfhDays = 0;
+	calcWeeks.push(4);
+	while (true) {
+		const end = calcWeeks.length - 1;
+		const start = Math.max(0, end - TOTAL_WEEKS + 1);
+
+		if (
+			calculateStatsFromWeeks(calcWeeks, start, end + 1).belt <
+			COMPLIANCE_THRESHOLD
+		) {
+			break;
+		}
+
+		if (calcWeeks[end] === 0) {
+			calcWeeks.push(4);
+		} else {
+			calcWeeks[end] -= 1;
+		}
+		wfhDays += 1;
+	}
+
+	return wfhDays;
+}
+
+/**
  * @param {string[]} dates
  * @returns {BeltStatsResult}
  */
 function calculateBeltStats(dates) {
+	const time = performance.now();
+
+	/** @type {BeltStatsResult} */
+	const result = {
+		attendedDateStrings: [],
+		currentBeltStat: 0,
+		currentDate: "",
+		maximumConsecutiveWfhDays: 0,
+		nextDayAttendanceStatChange: 0,
+	};
+
 	const now = new Date();
 	const today = utcPlus7DateOnly(now);
-	const todayIso = formatIsoDate(today);
-	const normalizedAttendedDateStrings = [...new Set(dates ?? [])].sort(
-		(left, right) => left.localeCompare(right),
-	);
-	const attendedDateSet = new Set(normalizedAttendedDateStrings);
-	const latestSelectedIso =
-		normalizedAttendedDateStrings[normalizedAttendedDateStrings.length - 1] ??
-		todayIso;
-	const latestSelectedDate = parseIsoDate(latestSelectedIso);
-	const beltStatAsOfDate =
-		latestSelectedDate > today ? latestSelectedDate : today;
+	let todayAttended = false;
 
-	const current = calculateBeltStat(
-		normalizedAttendedDateStrings,
-		beltStatAsOfDate,
-	);
-	const currentMonthAttendance = calculateCurrentMonthAttendance(
-		normalizedAttendedDateStrings,
-		today,
-	);
-	const currentMonthAttendanceDates = getCurrentMonthAttendanceDateStrings(
-		normalizedAttendedDateStrings,
-		today,
-	);
-	const maxIfTodayAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedAttendedDateStrings,
-		today,
-		todayAttended: true,
-	});
-	const maxIfTodayNotAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedAttendedDateStrings,
-		today,
-		todayAttended: false,
-	});
-	const deltaComparisonStartDate = nextWeekday(addDays(today, 1));
-	const deltaIfTodayAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedAttendedDateStrings,
-		today,
-		todayAttended: true,
-		startDateOverride: deltaComparisonStartDate,
-	});
-	const deltaIfTodayNotAttended = computeMaximumConsecutiveWfhDays({
-		attendedDateStrings: normalizedAttendedDateStrings,
-		today,
-		todayAttended: false,
-		startDateOverride: deltaComparisonStartDate,
-	});
-	const wfhStartDateIfTodayAttended = formatIsoDate(
-		getWfhStartDate(today, true),
-	);
-	const wfhStartDateIfTodayNotAttended = formatIsoDate(
-		getWfhStartDate(today, false),
+	result.currentDate = formatIsoDate(today);
+
+	const firstDate = addDays(startOfWeek(today), -(TOTAL_WEEKS - 1) * 7);
+
+	const calcWeeks = Array(TOTAL_WEEKS).fill(0); // Week attendance counts
+	const calcDates = Array(TOTAL_WEEKS * 7).fill(0); // Daily attendance flags
+
+	for (const dateString of dates) {
+		const date = parseIsoDate(dateString);
+		const dateInd = Math.floor(
+			(date.getTime() - firstDate.getTime()) / MS_PER_DAY,
+		);
+		const weekInd = Math.floor(dateInd / 7);
+
+		if (dateInd < 0 || dateInd >= calcDates.length) {
+			continue;
+		}
+		if (calcDates[dateInd]) {
+			continue;
+		}
+
+		result.attendedDateStrings.push(dateString);
+
+		calcDates[dateInd] = 1;
+		calcWeeks[weekInd] += 1;
+		if (date.getTime() === today.getTime()) {
+			todayAttended = true;
+		}
+	}
+
+	result.currentBeltStat = calculateStatsFromWeeks(calcWeeks).belt;
+
+	let remainingDaysThisWeek = 0;
+	if (1 <= today.getUTCDay() && today.getUTCDay() <= 5) {
+		remainingDaysThisWeek = 5 - today.getUTCDay();
+	}
+
+	result.maximumConsecutiveWfhDays =
+		calculateAdditionalWfhDays([...calcWeeks]) + remainingDaysThisWeek;
+
+	const weeksWithoutToday = [...calcWeeks];
+	if (todayAttended) {
+		weeksWithoutToday[weeksWithoutToday.length - 1] -= 1;
+	} else {
+		calcWeeks[calcWeeks.length - 1] += 1;
+	}
+	const wfhWithout = calculateAdditionalWfhDays(weeksWithoutToday);
+	const wfhWith = calculateAdditionalWfhDays(calcWeeks);
+	result.nextDayAttendanceStatChange = wfhWith - wfhWithout;
+
+	console.log(
+		"Time taken for calculateBeltStats:",
+		(performance.now() - time).toFixed(3),
+		"ms",
 	);
 
-	const todayWasAttended = attendedDateSet.has(todayIso);
-
-	return {
-		attendedDateStrings: normalizedAttendedDateStrings,
-		currentBeltStat: Number(current.average.toFixed(3)),
-		sumBestEight: current.sumBestEight,
-		currentMonthAttendance,
-		currentMonthAttendanceDates,
-		currentDate: todayIso,
-		maximumConsecutiveWfhDays: todayWasAttended
-			? maxIfTodayAttended
-			: maxIfTodayNotAttended,
-		nextDayAttendanceStatChange: deltaIfTodayAttended - deltaIfTodayNotAttended,
-		metadata: {
-			windowWeeks: TOTAL_WEEKS,
-			bestWeeksUsed: BEST_WEEKS_COUNT,
-			currentWeekIncluded: true,
-			beltStatAsOfDate: formatIsoDate(beltStatAsOfDate),
-			currentWeekAttendance: current.currentWeekAttendance,
-			bestEightBreakdown: current.selectedCounts,
-			trailingTwelveBreakdown: current.weeklyCounts,
-			wfhStartDateIfTodayAttended,
-			wfhStartDateIfTodayNotAttended,
-			deltaComparisonStartDate: formatIsoDate(deltaComparisonStartDate),
-			complianceThreshold: COMPLIANCE_THRESHOLD,
-			todayWasAttended,
-		},
-	};
+	return result;
 }
 
 module.exports = {

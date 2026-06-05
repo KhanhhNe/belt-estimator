@@ -58,6 +58,12 @@ function renderCurrentStatsPreview() {
 	});
 }
 
+function syncViewedMonthAttendance(attendedDateStrings) {
+	const syncedDates = new Set(attendedDateStrings ?? []);
+	baselineAttendedDateSet = new Set(syncedDates);
+	workingAttendedDateSet = new Set(syncedDates);
+}
+
 function getPendingPersistenceOperation(dateString) {
 	return pendingPersistenceOperations.get(dateString) ?? null;
 }
@@ -294,15 +300,11 @@ async function loadStats() {
 		}
 
 		const stats = await response.json();
-		const baselineDates = stats.attendedDateStrings ?? [];
-		baselineAttendedDateSet = new Set(baselineDates);
-		workingAttendedDateSet = new Set(baselineDates);
 		monthAttendanceCache.clear();
 		latestStatsPayload = stats;
 		if (!viewedMonthDateString) {
 			viewedMonthDateString = getMonthStartDateString(stats.currentDate);
 		}
-		renderStats(statsGrid, stats);
 		void ensureViewedMonthAttendanceLoaded();
 	} catch (error) {
 		statsGrid.innerHTML = `
@@ -372,36 +374,8 @@ function getMonthQueryToken(monthDateString) {
 	return `${month}/${year}`;
 }
 
-function getTrailingWindowStartDateString(statsPayload) {
-	if (!statsPayload?.currentDate) {
-		return null;
-	}
-
-	const windowWeeks = Number(statsPayload?.metadata?.windowWeeks ?? 12);
-	const currentDate = parseIsoDate(statsPayload.currentDate);
-	const mondayOffset = (currentDate.getUTCDay() + 6) % 7;
-	currentDate.setUTCDate(currentDate.getUTCDate() - mondayOffset);
-	currentDate.setUTCDate(currentDate.getUTCDate() - windowWeeks * 7);
-	return formatIsoDate(currentDate);
-}
-
-function isViewedMonthOutsideTrailingWindow() {
-	if (!latestStatsPayload || !viewedMonthDateString) {
-		return false;
-	}
-
-	const trailingStart = getTrailingWindowStartDateString(latestStatsPayload);
-	if (!trailingStart) {
-		return false;
-	}
-
-	return viewedMonthDateString < trailingStart;
-}
-
 function getCalendarAttendedDateStringsForViewedMonth() {
-	const attendedDates = isViewedMonthOutsideTrailingWindow()
-		? new Set(monthAttendanceCache.get(viewedMonthDateString) ?? [])
-		: new Set(workingAttendedDateSet);
+	const attendedDates = new Set(workingAttendedDateSet);
 
 	for (const [
 		dateString,
@@ -426,11 +400,10 @@ async function loadViewedMonthAttendance() {
 		return;
 	}
 
-	if (!isViewedMonthOutsideTrailingWindow()) {
-		return;
-	}
-
-	if (monthAttendanceCache.has(viewedMonthDateString)) {
+	const cachedAttendance = monthAttendanceCache.get(viewedMonthDateString);
+	if (cachedAttendance) {
+		syncViewedMonthAttendance(cachedAttendance);
+		renderCurrentStatsPreview();
 		return;
 	}
 
@@ -447,10 +420,12 @@ async function loadViewedMonthAttendance() {
 			return;
 		}
 
+		const attendedDateStrings = payload?.attendedDateStrings ?? [];
 		monthAttendanceCache.set(
 			viewedMonthDateString,
-			new Set(payload?.attendedDateStrings ?? []),
+			new Set(attendedDateStrings),
 		);
+		syncViewedMonthAttendance(attendedDateStrings);
 		renderCurrentStatsPreview();
 	} catch (error) {
 		if (requestId !== monthAttendanceLoadRequestId) {
@@ -651,8 +626,7 @@ function renderStats(target, payload) {
 		monthAttendanceInFlight
 			? "Updating preview..."
 			: "Tip: Click any date to preview. Ctrl+Click (or Cmd+Click) to save to database.";
-	const showHistoricalLoadingBadge =
-		monthAttendanceInFlight && isViewedMonthOutsideTrailingWindow();
+	const showHistoricalLoadingBadge = monthAttendanceInFlight;
 
 	const historicalLoadingBadgeMarkup = showHistoricalLoadingBadge
 		? `<p class="calendar-historical-loading" role="status" aria-live="polite"><span class="calendar-historical-loading-spinner" aria-hidden="true"></span>Loading historical month attendance...</p>`
@@ -899,7 +873,6 @@ function registerCalendarInteractions() {
 			viewedMonthDateString,
 			monthOffset,
 		);
-		renderStats(statsGrid, latestStatsPayload);
 		await ensureViewedMonthAttendanceLoaded();
 	}
 

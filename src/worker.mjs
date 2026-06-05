@@ -21,30 +21,6 @@ let cachedDb = null;
 let cachedCredentialsKey = null;
 const SESSION_COOKIE_NAME = "belt_sid";
 
-const API_DOCS = {
-	recordAttendance:
-		"POST /api/record-attendance records today's date (UTC+7) for the user identified by header User-Unique-Code.",
-	authRegister:
-		"POST /api/auth/register with { username, password } creates an account and starts a session.",
-	authLogin:
-		"POST /api/auth/login with { username, password } starts a session.",
-	authLogout: "POST /api/auth/logout clears the current session.",
-	authMe: "GET /api/auth/me returns current session user info.",
-	adminListUsers: "GET /api/admin/list-users returns all users (admin only).",
-	adminImpersonate:
-		"POST /api/admin/impersonate with { userId } signs in as the selected user (admin only).",
-	authForgotPasswordHash:
-		"POST /api/auth/forgot-password-hash with { username, newPassword } returns a bcrypt hash to share with Khanh Luong for manual reset.",
-	toggleAttendanceByDate:
-		"POST /api/attendance/toggle with { date } toggles attendance for the authenticated session user on a specific YYYY-MM-DD date.",
-	attendanceByMonth:
-		"GET /api/attendance?month=MM/YY returns attendance dates for the authenticated session user in that month.",
-	previewStats:
-		"POST /api/stats/preview requires an authenticated session, accepts attendedDateStrings (array of YYYY-MM-DD), and returns recomputed BELT stats without writing to database.",
-	stats:
-		"GET /api/stats requires an authenticated session and returns stats for the current session user.",
-};
-
 const app = express();
 app.use(express.json());
 
@@ -1139,7 +1115,14 @@ app.post(
 			);
 		}
 
-		const stats = calculateBeltStats(requestedDates);
+		const db = getDbForEnv(env);
+		const attendedDateStrings = await fetchAttendedDateStrings(
+			db,
+			session.userId,
+		);
+		const stats = calculateBeltStats(
+			attendedDateStrings.concat(requestedDates),
+		);
 		return json(stats);
 	}),
 	sendWorkerResponseMiddleware,
@@ -1164,18 +1147,7 @@ app.get(
 			session.userId,
 		);
 		const stats = calculateBeltStats(attendedDateStrings);
-		return json(
-			{
-				_docs: API_DOCS,
-				auth: {
-					authenticated: true,
-					userId: session.userId,
-					username: session.username,
-				},
-				...stats,
-			},
-			200,
-		);
+		return json(stats, 200);
 	}),
 	sendWorkerResponseMiddleware,
 );
