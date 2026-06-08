@@ -108,7 +108,7 @@ function createWorkerRequestFromExpress(req) {
 	});
 }
 
-async function sendWorkerResponseToExpress(res, response) {
+async function sendWorkerResponseToExpress(res, response, responseText) {
 	res.status(response.status);
 
 	response.headers.forEach((value, key) => {
@@ -118,7 +118,7 @@ async function sendWorkerResponseToExpress(res, response) {
 		res.setHeader(key, value);
 	});
 
-	res.send(await response.text());
+	res.send(responseText);
 }
 
 function sendUnhandledRouteError(res, error) {
@@ -156,8 +156,9 @@ async function sendWorkerResponseMiddleware(req, res, next) {
 			return;
 		}
 
-		await logWorkerErrorResponseIfNeeded(req, response);
-		await sendWorkerResponseToExpress(res, response);
+		const responseText = await response.text();
+		logWorkerErrorResponseIfNeeded(req, response, responseText);
+		await sendWorkerResponseToExpress(res, response, responseText);
 	} catch (error) {
 		next(error);
 	}
@@ -171,7 +172,7 @@ function handleApiRouteError(error, _req, res, _next) {
 	sendUnhandledRouteError(res, error);
 }
 
-async function logWorkerErrorResponseIfNeeded(req, response) {
+function logWorkerErrorResponseIfNeeded(req, response, responseText) {
 	if (!response || response.status < 400) {
 		return;
 	}
@@ -182,7 +183,7 @@ async function logWorkerErrorResponseIfNeeded(req, response) {
 
 	if (contentType.includes("application/json")) {
 		try {
-			const payload = await response.clone().json();
+			const payload = JSON.parse(responseText);
 			payloadError = payload?.error ?? null;
 			payloadDetails = payload?.details ?? null;
 		} catch {

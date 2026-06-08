@@ -78,6 +78,13 @@
 			"when": 1780380000000,
 			"tag": "0010_seed_baophan_attendance",
 			"breakpoints": true
+		},
+		{
+			"idx": 11,
+			"version": "6",
+			"when": 1788523200000,
+			"tag": "0011_seed_quangma_attendance",
+			"breakpoints": true
 		}
 	]
 }
