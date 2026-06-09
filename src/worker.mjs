@@ -21,6 +21,23 @@ const SESSION_COOKIE_NAME = "belt_sid";
 
 const app = express();
 app.use(express.json());
+app.enable("trust proxy");
+
+app.use((req, res, next) => {
+	const hostname = req.hostname?.toLowerCase() ?? "";
+	const isLocalhost =
+		hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+
+	if (!isLocalhost && !req.secure) {
+		const host = req.headers.host;
+		if (host) {
+			res.redirect(308, `https://${host}${req.originalUrl}`);
+			return;
+		}
+	}
+
+	next();
+});
 
 function redactRequestBody(value) {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
