@@ -211,15 +211,7 @@ function calculateAdditionalWfhDays(calcWeeks) {
 	const remainingDaysForLastWeek = 5 - (minDays - importantWeeksSum);
 	const result = fullWeeks * 5 + remainingDaysForLastWeek;
 
-	console.log({
-		importantWeeksCount,
-		importantWeeksSum,
-		fullWeeks,
-		remainingDaysForLastWeek,
-		result,
-	});
-
-	return result;
+	return Math.max(0, result);
 }
 
 /**
