@@ -161,7 +161,7 @@ function calculateStatsFromWeeks(
 	const beltVals = Array(8).fill(0);
 	for (let i = from; i < to; i++) {
 		const count = weeklyCounts[i] ?? 0;
-		if (count > 0 && count <= 8) {
+		if (count > 0) {
 			beltVals[count] += 1;
 		}
 	}
@@ -196,28 +196,30 @@ function calculateStatsFromWeeks(
  * @returns {number}
  */
 function calculateAdditionalWfhDays(calcWeeks) {
-	let wfhDays = 0;
-	calcWeeks.push(4);
-	while (true) {
-		const end = calcWeeks.length - 1;
-		const start = Math.max(0, end - TOTAL_WEEKS + 1);
+	const minDays = COMPLIANCE_THRESHOLD * 8;
 
-		if (
-			calculateStatsFromWeeks(calcWeeks, start, end + 1).belt <
-			COMPLIANCE_THRESHOLD
-		) {
-			break;
-		}
-
-		if (calcWeeks[end] === 0) {
-			calcWeeks.push(4);
-		} else {
-			calcWeeks[end] -= 1;
-		}
-		wfhDays += 1;
+	let ind = calcWeeks.length - 1,
+		importantWeeksSum = 0,
+		importantWeeksCount = 0;
+	while (ind >= 0 && importantWeeksSum < minDays - 5) {
+		importantWeeksSum += calcWeeks[ind];
+		importantWeeksCount += 1;
+		ind -= 1;
 	}
 
-	return wfhDays;
+	const fullWeeks = TOTAL_WEEKS - (importantWeeksCount + 1);
+	const remainingDaysForLastWeek = 5 - (minDays - importantWeeksSum);
+	const result = fullWeeks * 5 + remainingDaysForLastWeek;
+
+	console.log({
+		importantWeeksCount,
+		importantWeeksSum,
+		fullWeeks,
+		remainingDaysForLastWeek,
+		result,
+	});
+
+	return result;
 }
 
 /**
@@ -278,7 +280,7 @@ function calculateBeltStats(dates) {
 	}
 
 	result.maximumConsecutiveWfhDays =
-		calculateAdditionalWfhDays([...calcWeeks]) + remainingDaysThisWeek;
+		calculateAdditionalWfhDays(calcWeeks) + remainingDaysThisWeek;
 
 	const weeksWithoutToday = [...calcWeeks];
 	if (todayAttended) {
