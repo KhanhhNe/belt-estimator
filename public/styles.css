@@ -738,6 +738,19 @@ body {
 	opacity: 0.62;
 }
 
+.calendar-cell-attended-adjacent {
+	background: #dbf4e7;
+	border-color: #95d3af;
+	color: #0f6840;
+}
+
+.calendar-cell.calendar-cell-outside-month.calendar-cell-attended-adjacent {
+	background: #e8f8ef;
+	border-color: transparent;
+	color: #4a9b6f;
+	opacity: 0.75;
+}
+
 .calendar-cell-attended-user {
 	background: #dce8ff;
 	border-color: #93b2f7;
@@ -793,6 +806,14 @@ body {
 	),
 .calendar-matrix
 	> .calendar-cell.calendar-cell-outside-month.calendar-cell-attended:nth-child(
+		7n + 7
+	),
+.calendar-matrix
+	> .calendar-cell.calendar-cell-outside-month.calendar-cell-attended-adjacent:nth-child(
+		7n + 6
+	),
+.calendar-matrix
+	> .calendar-cell.calendar-cell-outside-month.calendar-cell-attended-adjacent:nth-child(
 		7n + 7
 	) {
 	background: #dbf4e7;

@@ -395,6 +395,41 @@ function getCalendarAttendedDateStringsForViewedMonth() {
 	return [...attendedDates];
 }
 
+async function fetchAndCacheMonth(monthDateString) {
+	if (!currentUser || monthAttendanceCache.has(monthDateString)) {
+		return;
+	}
+
+	try {
+		const month = getMonthQueryToken(monthDateString);
+		const payload = await fetchJsonOrThrow(
+			`/api/attendance?month=${encodeURIComponent(month)}`,
+		);
+		if (!monthAttendanceCache.has(monthDateString)) {
+			monthAttendanceCache.set(
+				monthDateString,
+				new Set(payload?.attendedDateStrings ?? []),
+			);
+			const prevMs = shiftMonthDateString(viewedMonthDateString, -1);
+			const nextMs = shiftMonthDateString(viewedMonthDateString, 1);
+			if (monthDateString === prevMs || monthDateString === nextMs) {
+				renderCurrentStatsPreview();
+			}
+		}
+	} catch (error) {
+		console.error(
+			"Failed to prefetch month attendance",
+			monthDateString,
+			error,
+		);
+	}
+}
+
+function prefetchAdjacentMonths(monthDateString) {
+	void fetchAndCacheMonth(shiftMonthDateString(monthDateString, -1));
+	void fetchAndCacheMonth(shiftMonthDateString(monthDateString, 1));
+}
+
 async function loadViewedMonthAttendance() {
 	if (!currentUser || !viewedMonthDateString) {
 		return;
@@ -404,6 +439,7 @@ async function loadViewedMonthAttendance() {
 	if (cachedAttendance) {
 		syncViewedMonthAttendance(cachedAttendance);
 		renderCurrentStatsPreview();
+		prefetchAdjacentMonths(viewedMonthDateString);
 		return;
 	}
 
@@ -427,6 +463,7 @@ async function loadViewedMonthAttendance() {
 		);
 		syncViewedMonthAttendance(attendedDateStrings);
 		renderCurrentStatsPreview();
+		prefetchAdjacentMonths(viewedMonthDateString);
 	} catch (error) {
 		if (requestId !== monthAttendanceLoadRequestId) {
 			return;
@@ -449,6 +486,7 @@ function buildMonthCalendarCells(
 	monthDateString,
 	todayDateString,
 	attendedDateStrings,
+	adjacentAttendedSets,
 ) {
 	const monthDate = parseIsoDate(monthDateString);
 	const year = monthDate.getUTCFullYear();
@@ -459,6 +497,8 @@ function buildMonthCalendarCells(
 	const mondayStartIndex = (firstOfMonth.getUTCDay() + 6) % 7;
 	const cells = [];
 	const attendedSet = new Set(attendedDateStrings || []);
+	const prevMonthSet = adjacentAttendedSets?.prev ?? null;
+	const nextMonthSet = adjacentAttendedSets?.next ?? null;
 
 	for (let pad = 0; pad < mondayStartIndex; pad += 1) {
 		const leadDate = new Date(
@@ -466,7 +506,10 @@ function buildMonthCalendarCells(
 		);
 		const leadIso = formatIsoDate(leadDate);
 		const leadDay = leadDate.getUTCDate();
-		const isAttended = attendedSet.has(leadIso);
+		const isAttendedFromAdjacent = prevMonthSet
+			? prevMonthSet.has(leadIso)
+			: false;
+		const isAttended = isAttendedFromAdjacent || attendedSet.has(leadIso);
 		const pendingPersistenceOperation = getPendingPersistenceOperation(leadIso);
 		const isPendingPersistCreate =
 			pendingPersistenceOperation?.shouldMarkAttended === true;
@@ -476,7 +519,9 @@ function buildMonthCalendarCells(
 
 		let className = "calendar-cell calendar-cell-outside-month";
 		if (isAttended) {
-			className += " calendar-cell-attended";
+			className += isAttendedFromAdjacent
+				? " calendar-cell-attended-adjacent"
+				: " calendar-cell-attended";
 		}
 		if (isUserUpdatedAttended) {
 			className += " calendar-cell-attended-user";
@@ -532,7 +577,10 @@ function buildMonthCalendarCells(
 	) {
 		const trailingDate = new Date(Date.UTC(year, month + 1, trailingDay));
 		const trailingIso = formatIsoDate(trailingDate);
-		const isAttended = attendedSet.has(trailingIso);
+		const isAttendedFromAdjacent = nextMonthSet
+			? nextMonthSet.has(trailingIso)
+			: false;
+		const isAttended = isAttendedFromAdjacent || attendedSet.has(trailingIso);
 		const pendingPersistenceOperation =
 			getPendingPersistenceOperation(trailingIso);
 		const isPendingPersistCreate =
@@ -543,7 +591,9 @@ function buildMonthCalendarCells(
 
 		let className = "calendar-cell calendar-cell-outside-month";
 		if (isAttended) {
-			className += " calendar-cell-attended";
+			className += isAttendedFromAdjacent
+				? " calendar-cell-attended-adjacent"
+				: " calendar-cell-attended";
 		}
 		if (isUserUpdatedAttended) {
 			className += " calendar-cell-attended-user";
@@ -601,10 +651,17 @@ function renderStats(target, payload) {
 				? "Missing today reduces runway"
 				: "No change either way";
 
+	const prevMonthDateString = shiftMonthDateString(viewedMonthDateString, -1);
+	const nextMonthDateString = shiftMonthDateString(viewedMonthDateString, 1);
+	const adjacentAttendedSets = {
+		prev: monthAttendanceCache.get(prevMonthDateString) ?? null,
+		next: monthAttendanceCache.get(nextMonthDateString) ?? null,
+	};
 	const calendarCellsMarkup = buildMonthCalendarCells(
 		viewedMonthDateString,
 		currentDate,
 		attendedDateStrings,
+		adjacentAttendedSets,
 	);
 	const monthLabel = formatMonthLabel(viewedMonthDateString);
 	const weekdayHeadersMarkup = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
