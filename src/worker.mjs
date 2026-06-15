@@ -75,25 +75,6 @@ function isValidIsoDate(dateString) {
 	return parsed.toISOString().slice(0, 10) === dateString;
 }
 
-function json(data, status = 200) {
-	return new Response(JSON.stringify(data), {
-		status,
-		headers: {
-			"Content-Type": "application/json",
-		},
-	});
-}
-
-function errorJson(_context, status, errorMessage, details, _metadata = {}) {
-	return json(
-		{
-			error: errorMessage,
-			details,
-		},
-		status,
-	);
-}
-
 function parseCookies(cookieHeader = "") {
 	return cookieHeader
 		.split(";")
@@ -166,24 +147,22 @@ async function deleteSessionById(sessionId, env) {
 	await db.delete(sessions).where(eq(sessions.sessionId, sessionId));
 }
 
-function withSessionCookie(data, sessionId, status = 200) {
-	return new Response(JSON.stringify(data), {
-		status,
-		headers: {
-			"Content-Type": "application/json",
-			"Set-Cookie": `${SESSION_COOKIE_NAME}=${encodeURIComponent(sessionId)}; Path=/; Max-Age=${SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax`,
-		},
-	});
+function withSessionCookie(c, data, sessionId, status = 200) {
+	c.status(status);
+	c.header(
+		"Set-Cookie",
+		`${SESSION_COOKIE_NAME}=${encodeURIComponent(sessionId)}; Path=/; Max-Age=${SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax`,
+	);
+	return c.json(data);
 }
 
-function withClearedSessionCookie(data, status = 200) {
-	return new Response(JSON.stringify(data), {
-		status,
-		headers: {
-			"Content-Type": "application/json",
-			"Set-Cookie": `${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`,
-		},
-	});
+function withClearedSessionCookie(c, data, status = 200) {
+	c.status(status);
+	c.header(
+		"Set-Cookie",
+		`${SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`,
+	);
+	return c.json(data);
 }
 
 function buildAuthResponse(session, user = null) {
@@ -209,12 +188,9 @@ async function getAuthenticatedUserFromRequest(request, env) {
 	const session = await getSessionFromRequest(request, env);
 	if (!session) {
 		return {
-			errorResponse: errorJson(
-				"auth",
-				401,
-				"Authentication required",
-				"Log in to access this endpoint",
-			),
+			errorStatus: 401,
+			errorMessage: "Authentication required",
+			errorDetails: "Log in to access this endpoint",
 		};
 	}
 
@@ -238,7 +214,7 @@ async function getAuthenticatedUserFromRequest(request, env) {
 		);
 		await deleteSessionById(session.id, env);
 		return {
-			errorResponse: withClearedSessionCookie(buildAuthResponse(null)),
+			sessionClearedResponse: true,
 		};
 	}
 
@@ -385,11 +361,12 @@ app.post("/api/auth/register", async (c) => {
 	const password = `${body?.password ?? ""}`;
 
 	if (!username || !password) {
-		return errorJson(
-			"auth-register",
+		return c.json(
+			{
+				error: "Invalid payload",
+				details: "username and password are required",
+			},
 			400,
-			"Invalid payload",
-			"username and password are required",
 		);
 	}
 
@@ -401,12 +378,9 @@ app.post("/api/auth/register", async (c) => {
 		.limit(1);
 
 	if (existingUsers.length > 0) {
-		return errorJson(
-			"auth-register",
+		return c.json(
+			{ error: "Username already exists", details: "Choose another username" },
 			409,
-			"Username already exists",
-			"Choose another username",
-			{ username },
 		);
 	}
 
@@ -425,6 +399,7 @@ app.post("/api/auth/register", async (c) => {
 	const insertedUser = insertedUsers[0];
 	const sessionId = await createSessionForUser(insertedUser, db);
 	return withSessionCookie(
+		c,
 		{
 			message: "Registered successfully",
 			...buildAuthResponse(
@@ -442,11 +417,12 @@ app.post("/api/auth/login", async (c) => {
 	const password = `${body?.password ?? ""}`;
 
 	if (!username || !password) {
-		return errorJson(
-			"auth-login",
+		return c.json(
+			{
+				error: "Invalid payload",
+				details: "username and password are required",
+			},
 			400,
-			"Invalid payload",
-			"username and password are required",
 		);
 	}
 
@@ -465,12 +441,12 @@ app.post("/api/auth/login", async (c) => {
 
 	const matchedUser = matchedUsers[0];
 	if (!matchedUser) {
-		return errorJson(
-			"auth-login",
+		return c.json(
+			{
+				error: "Invalid credentials",
+				details: "Incorrect username or password",
+			},
 			401,
-			"Invalid credentials",
-			"Incorrect username or password",
-			{ username },
 		);
 	}
 
@@ -480,17 +456,18 @@ app.post("/api/auth/login", async (c) => {
 		env,
 	);
 	if (!isPasswordValid) {
-		return errorJson(
-			"auth-login",
+		return c.json(
+			{
+				error: "Invalid credentials",
+				details: "Incorrect username or password",
+			},
 			401,
-			"Invalid credentials",
-			"Incorrect username or password",
-			{ username },
 		);
 	}
 
 	const sessionId = await createSessionForUser(matchedUser, db);
 	return withSessionCookie(
+		c,
 		{
 			message: "Logged in successfully",
 			...buildAuthResponse(
@@ -508,7 +485,7 @@ app.post("/api/auth/logout", async (c) => {
 		await deleteSessionById(session.id, env);
 	}
 
-	return withClearedSessionCookie({
+	return withClearedSessionCookie(c, {
 		authenticated: false,
 		message: "Logged out",
 	});
@@ -516,16 +493,16 @@ app.post("/api/auth/logout", async (c) => {
 app.get("/api/auth/me", async (c) => {
 	const request = c.req.raw;
 	const authResult = await getAuthenticatedUserFromRequest(request, env);
-	if (authResult.errorResponse) {
-		if (authResult.errorResponse.status === 401) {
-			return json(buildAuthResponse(null));
-		}
+	if (authResult.errorStatus) {
+		return c.json(buildAuthResponse(null));
+	}
 
-		return authResult.errorResponse;
+	if (authResult.sessionClearedResponse) {
+		return withClearedSessionCookie(c, buildAuthResponse(null));
 	}
 
 	const { session, user } = authResult;
-	return withSessionCookie(buildAuthResponse(session, user), session.id);
+	return withSessionCookie(c, buildAuthResponse(session, user), session.id);
 });
 app.post("/api/auth/forgot-password-hash", async (c) => {
 	const body = await c.req.json();
@@ -533,11 +510,12 @@ app.post("/api/auth/forgot-password-hash", async (c) => {
 	const newPassword = `${body?.newPassword ?? ""}`;
 
 	if (!username || !newPassword) {
-		return errorJson(
-			"forgot-password-hash",
+		return c.json(
+			{
+				error: "Invalid payload",
+				details: "username and newPassword are required",
+			},
 			400,
-			"Invalid payload",
-			"username and newPassword are required",
 		);
 	}
 
@@ -550,17 +528,17 @@ app.post("/api/auth/forgot-password-hash", async (c) => {
 
 	const matchedUser = matchedUsers[0];
 	if (!matchedUser) {
-		return errorJson(
-			"forgot-password-hash",
+		return c.json(
+			{
+				error: "User not found",
+				details: "No user exists with the provided username",
+			},
 			404,
-			"User not found",
-			"No user exists with the provided username",
-			{ username },
 		);
 	}
 
 	const passwordHash = await hashPassword(newPassword, env);
-	return json({
+	return c.json({
 		username: matchedUser.username,
 		passwordHash,
 		hint: "Send this username and password hash to Khanh Luong for manual password reset.",
@@ -570,17 +548,17 @@ app.post("/api/auth/forgot-password-hash", async (c) => {
 app.use("/api/admin/*", async (c, next) => {
 	const request = c.req.raw;
 	const authResult = await getAuthenticatedUserFromRequest(request, env);
-	if (authResult.errorResponse) {
-		return authResult.errorResponse;
+	if (authResult.errorStatus) {
+		return c.json(
+			{ error: authResult.errorMessage, details: authResult.errorDetails },
+			/** @type {any} */ (authResult.errorStatus),
+		);
 	}
 
 	if (!authResult.user.isAdmin) {
-		return errorJson(
-			"admin-authz",
+		return c.json(
+			{ error: "Forbidden", details: "Admin privileges required" },
 			403,
-			"Forbidden",
-			"Admin privileges required",
-			{ username: authResult.user.username },
 		);
 	}
 
@@ -590,18 +568,18 @@ app.use("/api/admin/*", async (c, next) => {
 app.get("/api/admin/list-users", async (c) => {
 	const request = c.req.raw;
 	const authResult = await getAuthenticatedUserFromRequest(request, env);
-	if (authResult.errorResponse) {
-		return authResult.errorResponse;
+	if (authResult.errorStatus) {
+		return c.json(
+			{ error: authResult.errorMessage, details: authResult.errorDetails },
+			/** @type {any} */ (authResult.errorStatus),
+		);
 	}
 
 	const { db, user } = authResult;
 	if (!user.isAdmin) {
-		return errorJson(
-			"admin-list-users",
+		return c.json(
+			{ error: "Forbidden", details: "Admin privileges required" },
 			403,
-			"Forbidden",
-			"Admin privileges required",
-			{ username: user.username },
 		);
 	}
 
@@ -614,7 +592,7 @@ app.get("/api/admin/list-users", async (c) => {
 		.from(users)
 		.orderBy(asc(users.username));
 
-	return json({
+	return c.json({
 		users: rows.map((row) => ({
 			id: row.id,
 			username: row.username,
@@ -625,29 +603,30 @@ app.get("/api/admin/list-users", async (c) => {
 app.post("/api/admin/impersonate", async (c) => {
 	const request = c.req.raw;
 	const authResult = await getAuthenticatedUserFromRequest(request, env);
-	if (authResult.errorResponse) {
-		return authResult.errorResponse;
+	if (authResult.errorStatus) {
+		return c.json(
+			{ error: authResult.errorMessage, details: authResult.errorDetails },
+			/** @type {any} */ (authResult.errorStatus),
+		);
 	}
 
 	const { db, session, user } = authResult;
 	if (!user.isAdmin) {
-		return errorJson(
-			"admin-impersonate",
+		return c.json(
+			{ error: "Forbidden", details: "Admin privileges required" },
 			403,
-			"Forbidden",
-			"Admin privileges required",
-			{ username: user.username },
 		);
 	}
 
 	const body = await c.req.json();
 	const userId = Number(body?.userId);
 	if (!Number.isInteger(userId) || userId <= 0) {
-		return errorJson(
-			"admin-impersonate",
+		return c.json(
+			{
+				error: "Invalid payload",
+				details: "userId must be a positive integer",
+			},
 			400,
-			"Invalid payload",
-			"userId must be a positive integer",
 		);
 	}
 
@@ -664,12 +643,9 @@ app.post("/api/admin/impersonate", async (c) => {
 
 	const targetUser = matchedUsers[0];
 	if (!targetUser) {
-		return errorJson(
-			"admin-impersonate",
+		return c.json(
+			{ error: "User not found", details: "The selected user does not exist" },
 			404,
-			"User not found",
-			"The selected user does not exist",
-			{ requestedUserId: userId },
 		);
 	}
 
@@ -677,6 +653,7 @@ app.post("/api/admin/impersonate", async (c) => {
 	await deleteSessionById(session.id, env);
 
 	return withSessionCookie(
+		c,
 		{
 			message: `Now logged in as ${targetUser.username}`,
 			...buildAuthResponse(
@@ -711,11 +688,13 @@ app.post("/api/record-attendance", async (c) => {
 		console.error(
 			`${logPrefix} Missing User-Unique-Code header after ${Date.now() - requestStartedAt}ms`,
 		);
-		return errorJson(
-			"record-attendance",
+		return c.json(
+			{
+				error: "Missing User-Unique-Code",
+				details:
+					"Provide header User-Unique-Code with a valid user unique code",
+			},
 			401,
-			"Missing User-Unique-Code",
-			"Provide header User-Unique-Code with a valid user unique code",
 		);
 	}
 
@@ -734,11 +713,12 @@ app.post("/api/record-attendance", async (c) => {
 				durationMs: Date.now() - requestStartedAt,
 			}),
 		);
-		return errorJson(
-			"record-attendance",
+		return c.json(
+			{
+				error: "Invalid User-Unique-Code",
+				details: "The provided unique code does not match any user",
+			},
 			403,
-			"Invalid User-Unique-Code",
-			"The provided unique code does not match any user",
 		);
 	}
 
@@ -762,7 +742,7 @@ app.post("/api/record-attendance", async (c) => {
 		}),
 	);
 
-	return json({
+	return c.json({
 		created,
 		date: attendanceDate,
 		username: matchedUser.username,
@@ -775,11 +755,12 @@ app.post("/api/attendance/toggle", async (c) => {
 	const request = c.req.raw;
 	const session = await getSessionFromRequest(request, env);
 	if (!session) {
-		return errorJson(
-			"attendance-toggle",
+		return c.json(
+			{
+				error: "Authentication required",
+				details: "Log in to toggle attendance",
+			},
 			401,
-			"Authentication required",
-			"Log in to toggle attendance",
 		);
 	}
 
@@ -787,11 +768,12 @@ app.post("/api/attendance/toggle", async (c) => {
 	const date = `${body?.date ?? ""}`.trim();
 
 	if (!isValidIsoDate(date)) {
-		return errorJson(
-			"attendance-toggle",
+		return c.json(
+			{
+				error: "Invalid payload",
+				details: "date is required and must be YYYY-MM-DD",
+			},
 			400,
-			"Invalid payload",
-			"date is required and must be YYYY-MM-DD",
 		);
 	}
 
@@ -813,7 +795,7 @@ app.post("/api/attendance/toggle", async (c) => {
 			.delete(attendanceRecords)
 			.where(eq(attendanceRecords.id, existing.id));
 
-		return json({
+		return c.json({
 			action: "deleted",
 			date,
 			message: "Attendance removed",
@@ -825,7 +807,7 @@ app.post("/api/attendance/toggle", async (c) => {
 		date,
 	});
 
-	return json({
+	return c.json({
 		action: "created",
 		date,
 		message: "Attendance recorded",
@@ -835,22 +817,24 @@ app.get("/api/attendance", async (c) => {
 	const request = c.req.raw;
 	const session = await getSessionFromRequest(request, env);
 	if (!session) {
-		return errorJson(
-			"attendance-month",
+		return c.json(
+			{
+				error: "Authentication required",
+				details: "Log in to access this endpoint",
+			},
 			401,
-			"Authentication required",
-			"Log in to access this endpoint",
 		);
 	}
 
 	const url = new URL(request.url);
 	const parsed = parseAttendanceMonth(url.searchParams.get("month"));
 	if (!parsed) {
-		return errorJson(
-			"attendance-month",
+		return c.json(
+			{
+				error: "Invalid month",
+				details: "month query must be MM/YY or MM/YYYY",
+			},
 			400,
-			"Invalid month",
-			"month query must be MM/YY or MM/YYYY",
 		);
 	}
 
@@ -872,7 +856,7 @@ app.get("/api/attendance", async (c) => {
 		)
 		.orderBy(asc(attendanceRecords.date));
 
-	return json({
+	return c.json({
 		month: `${parsed.month.toString().padStart(2, "0")}/${String(parsed.year).slice(-2)}`,
 		startDate,
 		endDateExclusive,
@@ -883,11 +867,12 @@ app.post("/api/stats/preview", async (c) => {
 	const request = c.req.raw;
 	const session = await getSessionFromRequest(request, env);
 	if (!session) {
-		return errorJson(
-			"stats-preview",
+		return c.json(
+			{
+				error: "Authentication required",
+				details: "Log in to access this endpoint",
+			},
 			401,
-			"Authentication required",
-			"Log in to access this endpoint",
 		);
 	}
 
@@ -895,11 +880,12 @@ app.post("/api/stats/preview", async (c) => {
 	const requestedDates = body?.attendedDateStrings;
 
 	if (!Array.isArray(requestedDates)) {
-		return errorJson(
-			"stats-preview",
+		return c.json(
+			{
+				error: "Invalid attendedDateStrings",
+				details: "Provide an array of ISO dates (YYYY-MM-DD)",
+			},
 			400,
-			"Invalid attendedDateStrings",
-			"Provide an array of ISO dates (YYYY-MM-DD)",
 		);
 	}
 
@@ -908,11 +894,12 @@ app.post("/api/stats/preview", async (c) => {
 	);
 
 	if (invalidDate) {
-		return errorJson(
-			"stats-preview",
+		return c.json(
+			{
+				error: "Invalid date",
+				details: `Invalid ISO date: ${invalidDate}`,
+			},
 			400,
-			"Invalid date",
-			`Invalid ISO date: ${invalidDate}`,
 		);
 	}
 
@@ -922,17 +909,18 @@ app.post("/api/stats/preview", async (c) => {
 		session.userId,
 	);
 	const stats = calculateBeltStats(attendedDateStrings.concat(requestedDates));
-	return json(stats);
+	return c.json(stats);
 });
 app.get("/api/stats", async (c) => {
 	const request = c.req.raw;
 	const session = await getSessionFromRequest(request, env);
 	if (!session) {
-		return errorJson(
-			"stats",
+		return c.json(
+			{
+				error: "Authentication required",
+				details: "Log in to access this endpoint",
+			},
 			401,
-			"Authentication required",
-			"Log in to access this endpoint",
 		);
 	}
 
@@ -942,7 +930,7 @@ app.get("/api/stats", async (c) => {
 		session.userId,
 	);
 	const stats = calculateBeltStats(attendedDateStrings);
-	return json(stats, 200);
+	return c.json(stats);
 });
 
 app.all("/api/*", (c) => {
