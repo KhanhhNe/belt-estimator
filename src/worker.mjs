@@ -15,6 +15,9 @@ const BCRYPT_SALT_ROUNDS = 10;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const SESSION_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
 
+/**
+ * @type {import("./db/client.js").db}
+ */
 let cachedDb = null;
 const SESSION_COOKIE_NAME = "belt_sid";
 
@@ -44,18 +47,6 @@ function _redactRequestBody(value) {
 function getUtcPlus7DateString(now = new Date()) {
 	const localTimeInUtcPlus7 = new Date(now.getTime() + 7 * 60 * 60 * 1000);
 	return localTimeInUtcPlus7.toISOString().slice(0, 10);
-}
-
-function maskUniqueCode(value = "") {
-	if (!value) {
-		return "[missing]";
-	}
-
-	if (value.length <= 4) {
-		return "****";
-	}
-
-	return `${value.slice(0, 2)}****${value.slice(-2)}`;
 }
 
 function isValidIsoDate(dateString) {
@@ -666,28 +657,11 @@ app.post("/api/admin/impersonate", async (c) => {
 });
 app.post("/api/record-attendance", async (c) => {
 	const request = c.req.raw;
-	const requestStartedAt = Date.now();
-	const requestUrl = new URL(request.url);
-	const logPrefix = "[record-attendance]";
 	const attendanceDate = getUtcPlus7DateString();
 	const db = getDbForEnv(env);
 	const userUniqueCode = request.headers.get("User-Unique-Code")?.trim();
 
-	console.log(
-		`${logPrefix} Request received`,
-		JSON.stringify({
-			method: request.method,
-			path: requestUrl.pathname,
-			date: attendanceDate,
-			hasUniqueCode: Boolean(userUniqueCode),
-			uniqueCodeHint: maskUniqueCode(userUniqueCode ?? ""),
-		}),
-	);
-
 	if (!userUniqueCode) {
-		console.error(
-			`${logPrefix} Missing User-Unique-Code header after ${Date.now() - requestStartedAt}ms`,
-		);
 		return c.json(
 			{
 				error: "Missing User-Unique-Code",
@@ -706,13 +680,6 @@ app.post("/api/record-attendance", async (c) => {
 
 	const matchedUser = matchedUsers[0];
 	if (!matchedUser) {
-		console.error(
-			`${logPrefix} Invalid unique code`,
-			JSON.stringify({
-				uniqueCodeHint: maskUniqueCode(userUniqueCode),
-				durationMs: Date.now() - requestStartedAt,
-			}),
-		);
 		return c.json(
 			{
 				error: "Invalid User-Unique-Code",
@@ -731,16 +698,6 @@ app.post("/api/record-attendance", async (c) => {
 		.returning({ insertedDate: attendanceRecords.date });
 
 	const created = result.length > 0;
-	console.log(
-		`${logPrefix} Attendance write completed`,
-		JSON.stringify({
-			created,
-			date: attendanceDate,
-			userId: matchedUser.id,
-			username: matchedUser.username,
-			durationMs: Date.now() - requestStartedAt,
-		}),
-	);
 
 	return c.json({
 		created,
