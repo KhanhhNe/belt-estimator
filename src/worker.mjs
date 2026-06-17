@@ -14,34 +14,26 @@ const BCRYPT_SALT_ROUNDS = 10;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const SESSION_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
 
-/**
- * @type {import("./db/client.js").db}
- */
-let cachedDb = null;
 const SESSION_COOKIE_NAME = "belt_sid";
 
+/**
+ * @typedef {{Bindings: typeof env}} ContextSchema
+ */
+/**
+ * @typedef {import('hono').Context<ContextSchema>} Context
+ */
+/**
+ * @type {import('hono').Hono<ContextSchema>}
+ */
 const app = new Hono();
 
-function _redactRequestBody(value) {
-	if (!value || typeof value !== "object" || Array.isArray(value)) {
-		return value;
+app.use(async (c, next) => {
+	await next();
+	const bookmark = getBookmarkFromContext(c);
+	if (bookmark) {
+		c.header("x-d1-bookmark", bookmark);
 	}
-
-	const redacted = {};
-	for (const [key, nestedValue] of Object.entries(value)) {
-		if (
-			key.toLowerCase().includes("password") ||
-			key.toLowerCase().includes("hash")
-		) {
-			redacted[key] = "[FILTERED]";
-			continue;
-		}
-
-		redacted[key] = nestedValue;
-	}
-
-	return redacted;
-}
+});
 
 function getUtcPlus7DateString(now = new Date()) {
 	const localTimeInUtcPlus7 = new Date(now.getTime() + 7 * 60 * 60 * 1000);
@@ -93,14 +85,17 @@ async function createSessionForUser(user, db) {
 	return sessionId;
 }
 
-async function getSessionFromRequest(request, env) {
-	const cookies = parseCookies(request.headers.get("Cookie") ?? "");
+/**
+ * @param {Context} c
+ */
+async function getSessionFromRequest(c) {
+	const cookies = parseCookies(c.req.raw.headers.get("Cookie") ?? "");
 	const sessionId = cookies[SESSION_COOKIE_NAME];
 	if (!sessionId) {
 		return null;
 	}
 
-	const db = getDbForEnv(env);
+	const db = getDbFromContext(c);
 	const matchedSessions = await db
 		.select({
 			id: sessions.sessionId,
@@ -132,8 +127,12 @@ async function getSessionFromRequest(request, env) {
 	return session;
 }
 
-async function deleteSessionById(sessionId, env) {
-	const db = getDbForEnv(env);
+/**
+ * @param {Context} c
+ * @param {string} sessionId
+ */
+async function deleteSessionById(c, sessionId) {
+	const db = getDbFromContext(c);
 	await db.delete(sessions).where(eq(sessions.sessionId, sessionId));
 }
 
@@ -181,8 +180,11 @@ function buildAuthResponse(session, user = null) {
 	};
 }
 
-async function getAuthenticatedUserFromRequest(request, env) {
-	const session = await getSessionFromRequest(request, env);
+/**
+ * @param {Context} c
+ */
+async function getAuthenticatedUserFromRequest(c) {
+	const session = await getSessionFromRequest(c);
 	if (!session) {
 		return {
 			errorStatus: 401,
@@ -191,7 +193,7 @@ async function getAuthenticatedUserFromRequest(request, env) {
 		};
 	}
 
-	const db = getDbForEnv(env);
+	const db = getDbFromContext(c);
 	const matchedUsers = await db
 		.select({
 			id: users.id,
@@ -209,7 +211,7 @@ async function getAuthenticatedUserFromRequest(request, env) {
 			"[auth] Session user not found; clearing session",
 			JSON.stringify({ sessionId: session.id, userId: session.userId }),
 		);
-		await deleteSessionById(session.id, env);
+		await deleteSessionById(c, session.id);
 		return {
 			sessionClearedResponse: true,
 		};
@@ -283,16 +285,32 @@ async function generateUniqueCode(db) {
 	throw new Error("Unable to generate unique code");
 }
 
-function getDbForEnv(env) {
+function createDbSessionFromBookmark(env, bookmark = "first-unconstrained") {
 	if (!env?.belt_estimator) {
 		throw new Error("Missing D1 binding belt_estimator in Worker environment");
 	}
 
-	if (!cachedDb) {
-		cachedDb = drizzle(env.belt_estimator);
-	}
+	return env.belt_estimator.withSession(bookmark);
+}
 
-	return cachedDb;
+/**
+ * @param {Context} c
+ */
+function getDbFromContext(c) {
+	const incomingBookmark =
+		c.req.raw.headers.get("x-d1-bookmark") ?? "first-unconstrained";
+	const d1Session = createDbSessionFromBookmark(c.env, incomingBookmark);
+
+	// Store session on context for later bookmark retrieval
+	c.env = c.env || {};
+	c.env._d1Session = d1Session;
+
+	return drizzle(d1Session);
+}
+
+function getBookmarkFromContext(c) {
+	const d1Session = c.env?._d1Session;
+	return d1Session?.getBookmark() ?? "first-unconstrained";
 }
 
 function parseAttendanceMonth(monthToken) {
@@ -325,35 +343,6 @@ app.get("/", (c) => {
 	return c.json({ message: "Hono.js running on Cloudflare Workers!" });
 });
 
-// app.use("/api/*", async (c, next) => {
-// 	const startedAt = Date.now();
-// 	const startedIso = new Date(startedAt).toISOString();
-// 	const remoteIp =
-// 		c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
-// 	const format = c.req.header("content-type")?.includes("application/json")
-// 		? "JSON"
-// 		: "HTML";
-// 	const parsedBody = ["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method)
-// 		? await c.req.json().catch(() => ({}))
-// 		: {};
-// 	const safeParams = redactRequestBody(parsedBody);
-//
-// 	console.log(
-// 		`Started ${c.req.method} "${new URL(c.req.url).pathname}" for ${remoteIp} at ${startedIso}`,
-// 	);
-// 	console.log(`Processing by Worker as ${format}`);
-// 	if (Object.keys(safeParams).length > 0) {
-// 		console.log(`Parameters: ${JSON.stringify(safeParams)}`);
-// 	}
-//
-// 	await next();
-//
-// 	const durationMs = Date.now() - startedAt;
-// 	console.log(
-// 		`Completed ${c.res.status} in ${durationMs}ms (Bytes: ${c.res.headers.get("content-length") ?? "unknown"})`,
-// 	);
-// });
-
 app.post("/api/auth/register", async (c) => {
 	const body = await c.req.json();
 	const username = `${body?.username ?? ""}`.trim();
@@ -369,7 +358,7 @@ app.post("/api/auth/register", async (c) => {
 		);
 	}
 
-	const db = getDbForEnv(env);
+	const db = getDbFromContext(c);
 	const existingUsers = await db
 		.select({ id: users.id })
 		.from(users)
@@ -425,7 +414,7 @@ app.post("/api/auth/login", async (c) => {
 		);
 	}
 
-	const db = getDbForEnv(env);
+	const db = getDbFromContext(c);
 	const matchedUsers = await db
 		.select({
 			id: users.id,
@@ -478,10 +467,9 @@ app.post("/api/auth/login", async (c) => {
 	);
 });
 app.post("/api/auth/logout", async (c) => {
-	const request = c.req.raw;
-	const session = await getSessionFromRequest(request, env);
+	const session = await getSessionFromRequest(c);
 	if (session) {
-		await deleteSessionById(session.id, env);
+		await deleteSessionById(c, session.id);
 	}
 
 	return withClearedSessionCookie(c, {
@@ -490,8 +478,7 @@ app.post("/api/auth/logout", async (c) => {
 	});
 });
 app.get("/api/auth/me", async (c) => {
-	const request = c.req.raw;
-	const authResult = await getAuthenticatedUserFromRequest(request, env);
+	const authResult = await getAuthenticatedUserFromRequest(c);
 	if (authResult.errorStatus) {
 		return c.json(buildAuthResponse(null));
 	}
@@ -518,7 +505,7 @@ app.post("/api/auth/forgot-password-hash", async (c) => {
 		);
 	}
 
-	const db = getDbForEnv(env);
+	const db = getDbFromContext(c);
 	const matchedUsers = await db
 		.select({ id: users.id, username: users.username })
 		.from(users)
@@ -545,8 +532,7 @@ app.post("/api/auth/forgot-password-hash", async (c) => {
 });
 
 app.use("/api/admin/*", async (c, next) => {
-	const request = c.req.raw;
-	const authResult = await getAuthenticatedUserFromRequest(request, env);
+	const authResult = await getAuthenticatedUserFromRequest(c);
 	if (authResult.errorStatus) {
 		return c.json(
 			{ error: authResult.errorMessage, details: authResult.errorDetails },
@@ -565,8 +551,7 @@ app.use("/api/admin/*", async (c, next) => {
 });
 
 app.get("/api/admin/list-users", async (c) => {
-	const request = c.req.raw;
-	const authResult = await getAuthenticatedUserFromRequest(request, env);
+	const authResult = await getAuthenticatedUserFromRequest(c);
 	if (authResult.errorStatus) {
 		return c.json(
 			{ error: authResult.errorMessage, details: authResult.errorDetails },
@@ -600,8 +585,7 @@ app.get("/api/admin/list-users", async (c) => {
 	});
 });
 app.post("/api/admin/impersonate", async (c) => {
-	const request = c.req.raw;
-	const authResult = await getAuthenticatedUserFromRequest(request, env);
+	const authResult = await getAuthenticatedUserFromRequest(c);
 	if (authResult.errorStatus) {
 		return c.json(
 			{ error: authResult.errorMessage, details: authResult.errorDetails },
@@ -649,7 +633,7 @@ app.post("/api/admin/impersonate", async (c) => {
 	}
 
 	const newSessionId = await createSessionForUser(targetUser, db);
-	await deleteSessionById(session.id, env);
+	await deleteSessionById(c, session.id);
 
 	return withSessionCookie(
 		c,
@@ -664,10 +648,9 @@ app.post("/api/admin/impersonate", async (c) => {
 	);
 });
 app.post("/api/record-attendance", async (c) => {
-	const request = c.req.raw;
 	const attendanceDate = getUtcPlus7DateString();
-	const db = getDbForEnv(env);
-	const userUniqueCode = request.headers.get("User-Unique-Code")?.trim();
+	const db = getDbFromContext(c);
+	const userUniqueCode = c.req.raw.headers.get("User-Unique-Code")?.trim();
 
 	if (!userUniqueCode) {
 		return c.json(
@@ -731,8 +714,7 @@ app.post("/api/record-attendance", async (c) => {
 	});
 });
 app.post("/api/attendance/toggle", async (c) => {
-	const request = c.req.raw;
-	const session = await getSessionFromRequest(request, env);
+	const session = await getSessionFromRequest(c);
 	if (!session) {
 		return c.json(
 			{
@@ -756,7 +738,7 @@ app.post("/api/attendance/toggle", async (c) => {
 		);
 	}
 
-	const db = getDbForEnv(env);
+	const db = getDbFromContext(c);
 	const existingRows = await db
 		.select({ id: attendanceRecords.id })
 		.from(attendanceRecords)
@@ -793,8 +775,7 @@ app.post("/api/attendance/toggle", async (c) => {
 	});
 });
 app.get("/api/attendance", async (c) => {
-	const request = c.req.raw;
-	const session = await getSessionFromRequest(request, env);
+	const session = await getSessionFromRequest(c);
 	if (!session) {
 		return c.json(
 			{
@@ -805,7 +786,7 @@ app.get("/api/attendance", async (c) => {
 		);
 	}
 
-	const url = new URL(request.url);
+	const url = new URL(c.req.raw.url);
 	const parsed = parseAttendanceMonth(url.searchParams.get("month"));
 	if (!parsed) {
 		return c.json(
@@ -822,7 +803,7 @@ app.get("/api/attendance", async (c) => {
 	const nextMonthYear = parsed.month === 12 ? parsed.year + 1 : parsed.year;
 	const endDateExclusive = formatMonthRangeBoundary(nextMonthYear, nextMonth);
 
-	const db = getDbForEnv(env);
+	const db = getDbFromContext(c);
 	const rows = await db
 		.select({ date: attendanceRecords.date })
 		.from(attendanceRecords)
@@ -843,8 +824,7 @@ app.get("/api/attendance", async (c) => {
 	});
 });
 app.post("/api/stats/preview", async (c) => {
-	const request = c.req.raw;
-	const session = await getSessionFromRequest(request, env);
+	const session = await getSessionFromRequest(c);
 	if (!session) {
 		return c.json(
 			{
@@ -882,7 +862,7 @@ app.post("/api/stats/preview", async (c) => {
 		);
 	}
 
-	const db = getDbForEnv(env);
+	const db = getDbFromContext(c);
 	const attendedDateStrings = await fetchAttendedDateStrings(
 		db,
 		session.userId,
@@ -891,8 +871,7 @@ app.post("/api/stats/preview", async (c) => {
 	return c.json(stats);
 });
 app.get("/api/stats", async (c) => {
-	const request = c.req.raw;
-	const session = await getSessionFromRequest(request, env);
+	const session = await getSessionFromRequest(c);
 	if (!session) {
 		return c.json(
 			{
@@ -903,7 +882,7 @@ app.get("/api/stats", async (c) => {
 		);
 	}
 
-	const db = getDbForEnv(env);
+	const db = getDbFromContext(c);
 	const attendedDateStrings = await fetchAttendedDateStrings(
 		db,
 		session.userId,

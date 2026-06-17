@@ -27,6 +27,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.15",
+		"@cloudflare/workers-types": "^4.20260617.1",
 		"@types/node": "^25.9.1",
 		"drizzle-kit": "^0.31.10",
 		"nodemon": "^3.1.14",
