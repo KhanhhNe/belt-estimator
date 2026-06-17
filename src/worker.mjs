@@ -680,14 +680,21 @@ app.post("/api/record-attendance", async (c) => {
 		);
 	}
 
-	const matchedUsers = await db
-		.select({ id: users.id })
+	const matchedRows = await db
+		.select({ userId: users.id, attendanceRecordId: attendanceRecords.id })
 		.from(users)
+		.leftJoin(
+			attendanceRecords,
+			and(
+				eq(attendanceRecords.userId, users.id),
+				eq(attendanceRecords.date, attendanceDate),
+			),
+		)
 		.where(eq(users.uniqueCode, userUniqueCode))
 		.limit(1);
 
-	const matchedUser = matchedUsers[0];
-	if (!matchedUser) {
+	const matchedRow = matchedRows[0];
+	if (!matchedRow) {
 		return c.json(
 			{
 				error: "Invalid User-Unique-Code",
@@ -697,9 +704,17 @@ app.post("/api/record-attendance", async (c) => {
 		);
 	}
 
+	if (matchedRow.attendanceRecordId) {
+		return c.json({
+			created: false,
+			date: attendanceDate,
+			message: "Attendance already exists for this UTC+7 date",
+		});
+	}
+
 	const result = await db
 		.insert(attendanceRecords)
-		.values({ date: attendanceDate, userId: matchedUser.id })
+		.values({ date: attendanceDate, userId: matchedRow.userId })
 		.onConflictDoNothing({
 			target: [attendanceRecords.userId, attendanceRecords.date],
 		})
