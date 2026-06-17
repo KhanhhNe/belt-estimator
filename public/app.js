@@ -24,6 +24,11 @@ const pendingPersistenceOperations = new Map();
 
 const ATTENDANCE_PREVIEW_DEBOUNCE_MS = 300;
 
+function getUtcPlus7DateString(now = new Date()) {
+	const localTimeInUtcPlus7 = new Date(now.getTime() + 7 * 60 * 60 * 1000);
+	return localTimeInUtcPlus7.toISOString().slice(0, 10);
+}
+
 function escapeHtml(value) {
 	return `${value}`
 		.replaceAll("&", "&amp;")
@@ -44,6 +49,20 @@ function setStatsLocked(isLocked) {
 	} else {
 		statsShell.classList.remove("stats-shell-locked");
 	}
+}
+
+function resetDashboardData() {
+	baselineAttendedDateSet = new Set();
+	workingAttendedDateSet = new Set();
+	latestStatsPayload = null;
+	viewedMonthDateString = null;
+	monthAttendanceCache.clear();
+	monthAttendanceLoadRequestId += 1;
+	monthAttendanceInFlight = false;
+}
+
+function getInitialViewedMonthDateString() {
+	return getMonthStartDateString(getUtcPlus7DateString());
 }
 
 function renderCurrentStatsPreview() {
@@ -291,6 +310,7 @@ async function loadStats() {
 			if (response.status === 401) {
 				currentUser = null;
 				authPanelMessage = "Session expired. Please login again.";
+				resetDashboardData();
 				renderAuthUi();
 				loadStats();
 				return;
@@ -300,12 +320,7 @@ async function loadStats() {
 		}
 
 		const stats = await response.json();
-		monthAttendanceCache.clear();
 		latestStatsPayload = stats;
-		if (!viewedMonthDateString) {
-			viewedMonthDateString = getMonthStartDateString(stats.currentDate);
-		}
-		void ensureViewedMonthAttendanceLoaded();
 	} catch (error) {
 		statsGrid.innerHTML = `
       <article class="stat-card stat-card-primary">
@@ -425,11 +440,6 @@ async function fetchAndCacheMonth(monthDateString) {
 	}
 }
 
-function prefetchAdjacentMonths(monthDateString) {
-	void fetchAndCacheMonth(shiftMonthDateString(monthDateString, -1));
-	void fetchAndCacheMonth(shiftMonthDateString(monthDateString, 1));
-}
-
 async function loadViewedMonthAttendance() {
 	if (!currentUser || !viewedMonthDateString) {
 		return;
@@ -439,31 +449,44 @@ async function loadViewedMonthAttendance() {
 	if (cachedAttendance) {
 		syncViewedMonthAttendance(cachedAttendance);
 		renderCurrentStatsPreview();
-		prefetchAdjacentMonths(viewedMonthDateString);
+		void Promise.all([
+			fetchAndCacheMonth(shiftMonthDateString(viewedMonthDateString, -1)),
+			fetchAndCacheMonth(shiftMonthDateString(viewedMonthDateString, 1)),
+		]);
 		return;
 	}
 
 	const requestId = ++monthAttendanceLoadRequestId;
 	monthAttendanceInFlight = true;
 	renderCurrentStatsPreview();
+	const currentMonthDateString = viewedMonthDateString;
+	const prevMonthDateString = shiftMonthDateString(currentMonthDateString, -1);
+	const nextMonthDateString = shiftMonthDateString(currentMonthDateString, 1);
 
 	try {
-		const month = getMonthQueryToken(viewedMonthDateString);
-		const payload = await fetchJsonOrThrow(
-			`/api/attendance?month=${encodeURIComponent(month)}`,
-		);
-		if (requestId !== monthAttendanceLoadRequestId) {
-			return;
-		}
+		const currentMonthLoad = (async () => {
+			const month = getMonthQueryToken(currentMonthDateString);
+			const payload = await fetchJsonOrThrow(
+				`/api/attendance?month=${encodeURIComponent(month)}`,
+			);
+			if (requestId !== monthAttendanceLoadRequestId) {
+				return;
+			}
 
-		const attendedDateStrings = payload?.attendedDateStrings ?? [];
-		monthAttendanceCache.set(
-			viewedMonthDateString,
-			new Set(attendedDateStrings),
-		);
-		syncViewedMonthAttendance(attendedDateStrings);
-		renderCurrentStatsPreview();
-		prefetchAdjacentMonths(viewedMonthDateString);
+			const attendedDateStrings = payload?.attendedDateStrings ?? [];
+			monthAttendanceCache.set(
+				currentMonthDateString,
+				new Set(attendedDateStrings),
+			);
+			syncViewedMonthAttendance(attendedDateStrings);
+			renderCurrentStatsPreview();
+		})();
+
+		await Promise.all([
+			currentMonthLoad,
+			fetchAndCacheMonth(prevMonthDateString),
+			fetchAndCacheMonth(nextMonthDateString),
+		]);
 	} catch (error) {
 		if (requestId !== monthAttendanceLoadRequestId) {
 			return;
@@ -480,6 +503,19 @@ async function loadViewedMonthAttendance() {
 
 async function ensureViewedMonthAttendanceLoaded() {
 	await loadViewedMonthAttendance();
+}
+
+async function loadDashboardData() {
+	if (!currentUser) {
+		await loadStats();
+		return;
+	}
+
+	if (!viewedMonthDateString) {
+		viewedMonthDateString = getInitialViewedMonthDateString();
+	}
+
+	await Promise.all([loadStats(), loadViewedMonthAttendance()]);
 }
 
 function buildMonthCalendarCells(
@@ -616,7 +652,7 @@ function buildMonthCalendarCells(
 function renderStats(target, payload) {
 	const currentBeltStat = Number(payload.currentBeltStat ?? 0);
 	const attendedDateStrings = payload.attendedDateStrings ?? [];
-	const currentDate = payload.currentDate;
+	const currentDate = getUtcPlus7DateString();
 	const maximumConsecutiveWfhDays = Number(
 		payload.maximumConsecutiveWfhDays ?? 0,
 	);
@@ -1021,11 +1057,9 @@ function registerAuthInteractions() {
 			adminImpersonationInFlight = false;
 			adminPanelMessage = "";
 			authPanelMessage = "Logged out successfully.";
-			baselineAttendedDateSet = new Set();
-			workingAttendedDateSet = new Set();
-			latestStatsPayload = null;
+			resetDashboardData();
 			renderAuthUi();
-			loadStats();
+			await loadDashboardData();
 		} catch (error) {
 			authPanelMessage = `Logout failed: ${error.message}`;
 			renderAuthUi();
@@ -1063,10 +1097,8 @@ function registerAuthInteractions() {
 			forgotPasswordDraft = { username: initialUsername };
 			authPanelMessage = "";
 			renderAuthUi();
-			document.getElementById("forgot-new-password")?.focus();
 			return;
 		}
-
 		if (action === "cancel-forgot-password") {
 			forgotPasswordDraft = null;
 			renderAuthUi();
@@ -1246,13 +1278,10 @@ function registerAuthInteractions() {
 
 			currentUser = authResponse.user;
 			authPanelMessage = "";
-			baselineAttendedDateSet = new Set();
-			workingAttendedDateSet = new Set();
-			latestStatsPayload = null;
-			viewedMonthDateString = null;
+			resetDashboardData();
 			renderAuthUi();
 			await loadAdminUsersIfNeeded();
-			loadStats();
+			await loadDashboardData();
 		} catch (error) {
 			authPanelMessage = `Authentication failed: ${error.message}`;
 			renderAuthUi();
@@ -1272,7 +1301,7 @@ async function initializeApp() {
 		renderAuthUi();
 	}
 
-	await loadStats();
+	await loadDashboardData();
 }
 
 initializeApp();

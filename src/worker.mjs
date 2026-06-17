@@ -29,7 +29,10 @@ const app = new Hono();
 
 app.use(async (c, next) => {
 	await next();
-	const bookmark = getBookmarkFromContext(c);
+	const d1Session = /** @type {{ getBookmark?: () => string } | undefined} */ (
+		c.env?._d1Session
+	);
+	const bookmark = d1Session?.getBookmark?.() ?? "first-unconstrained";
 	if (bookmark) {
 		c.header("x-d1-bookmark", bookmark);
 	}
@@ -101,6 +104,7 @@ async function getSessionFromRequest(c) {
 			id: sessions.sessionId,
 			userId: sessions.userId,
 			username: users.username,
+			isAdmin: users.isAdmin,
 			createdAt: sessions.createdAt,
 		})
 		.from(sessions)
@@ -115,12 +119,11 @@ async function getSessionFromRequest(c) {
 
 	const now = Date.now();
 	if (now - session.createdAt > SESSION_TTL_MS) {
-		await db.delete(sessions).where(eq(sessions.sessionId, session.id));
+		db.delete(sessions).where(eq(sessions.sessionId, session.id));
 		return null;
 	}
 
-	await db
-		.update(sessions)
+	db.update(sessions)
 		.set({ createdAt: now })
 		.where(eq(sessions.sessionId, session.id));
 
@@ -187,40 +190,22 @@ async function getAuthenticatedUserFromRequest(c) {
 	const session = await getSessionFromRequest(c);
 	if (!session) {
 		return {
-			errorStatus: 401,
+			errorStatus:
+				/** @type {import('hono/utils/http-status').ContentfulStatusCode} */ (
+					401
+				),
 			errorMessage: "Authentication required",
 			errorDetails: "Log in to access this endpoint",
 		};
 	}
 
-	const db = getDbFromContext(c);
-	const matchedUsers = await db
-		.select({
-			id: users.id,
-			username: users.username,
-			uniqueCode: users.uniqueCode,
-			isAdmin: users.isAdmin,
-		})
-		.from(users)
-		.where(eq(users.id, session.userId))
-		.limit(1);
-
-	const matchedUser = matchedUsers[0];
-	if (!matchedUser) {
-		console.error(
-			"[auth] Session user not found; clearing session",
-			JSON.stringify({ sessionId: session.id, userId: session.userId }),
-		);
-		await deleteSessionById(c, session.id);
-		return {
-			sessionClearedResponse: true,
-		};
-	}
-
 	return {
-		db,
 		session,
-		user: matchedUser,
+		user: {
+			id: session.userId,
+			username: session.username,
+			isAdmin: Boolean(session.isAdmin),
+		},
 	};
 }
 
@@ -285,6 +270,10 @@ async function generateUniqueCode(db) {
 	throw new Error("Unable to generate unique code");
 }
 
+/**
+ * @param {typeof env} env
+ * @param {string} [bookmark]
+ */
 function createDbSessionFromBookmark(env, bookmark = "first-unconstrained") {
 	if (!env?.belt_estimator) {
 		throw new Error("Missing D1 binding belt_estimator in Worker environment");
@@ -306,11 +295,6 @@ function getDbFromContext(c) {
 	c.env._d1Session = d1Session;
 
 	return drizzle(d1Session);
-}
-
-function getBookmarkFromContext(c) {
-	const d1Session = c.env?._d1Session;
-	return d1Session?.getBookmark() ?? "first-unconstrained";
 }
 
 function parseAttendanceMonth(monthToken) {
@@ -536,7 +520,7 @@ app.use("/api/admin/*", async (c, next) => {
 	if (authResult.errorStatus) {
 		return c.json(
 			{ error: authResult.errorMessage, details: authResult.errorDetails },
-			/** @type {any} */ (authResult.errorStatus),
+			authResult.errorStatus,
 		);
 	}
 
@@ -551,21 +535,7 @@ app.use("/api/admin/*", async (c, next) => {
 });
 
 app.get("/api/admin/list-users", async (c) => {
-	const authResult = await getAuthenticatedUserFromRequest(c);
-	if (authResult.errorStatus) {
-		return c.json(
-			{ error: authResult.errorMessage, details: authResult.errorDetails },
-			/** @type {any} */ (authResult.errorStatus),
-		);
-	}
-
-	const { db, user } = authResult;
-	if (!user.isAdmin) {
-		return c.json(
-			{ error: "Forbidden", details: "Admin privileges required" },
-			403,
-		);
-	}
+	const db = getDbFromContext(c);
 
 	const rows = await db
 		.select({
@@ -585,21 +555,8 @@ app.get("/api/admin/list-users", async (c) => {
 	});
 });
 app.post("/api/admin/impersonate", async (c) => {
+	const db = getDbFromContext(c);
 	const authResult = await getAuthenticatedUserFromRequest(c);
-	if (authResult.errorStatus) {
-		return c.json(
-			{ error: authResult.errorMessage, details: authResult.errorDetails },
-			/** @type {any} */ (authResult.errorStatus),
-		);
-	}
-
-	const { db, session, user } = authResult;
-	if (!user.isAdmin) {
-		return c.json(
-			{ error: "Forbidden", details: "Admin privileges required" },
-			403,
-		);
-	}
 
 	const body = await c.req.json();
 	const userId = Number(body?.userId);
@@ -633,7 +590,7 @@ app.post("/api/admin/impersonate", async (c) => {
 	}
 
 	const newSessionId = await createSessionForUser(targetUser, db);
-	await deleteSessionById(c, session.id);
+	await deleteSessionById(c, authResult.session.id);
 
 	return withSessionCookie(
 		c,
@@ -887,7 +844,7 @@ app.get("/api/stats", async (c) => {
 		db,
 		session.userId,
 	);
-	const stats = calculateBeltStats(attendedDateStrings);
+	const { currentDate, ...stats } = calculateBeltStats(attendedDateStrings);
 	return c.json(stats);
 });
 
