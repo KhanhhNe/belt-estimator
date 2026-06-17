@@ -138,6 +138,13 @@ async function deleteSessionById(sessionId, env) {
 	await db.delete(sessions).where(eq(sessions.sessionId, sessionId));
 }
 
+/**
+ * @param {import('hono').Context} c
+ * @param {Record<string, unknown>} data
+ * @param {string} sessionId
+ * @param {import('hono/utils/http-status').StatusCode} status
+ * @returns {Response}
+ */
 function withSessionCookie(c, data, sessionId, status = 200) {
 	c.status(status);
 	c.header(
@@ -673,7 +680,7 @@ app.post("/api/record-attendance", async (c) => {
 	}
 
 	const matchedUsers = await db
-		.select({ id: users.id, username: users.username })
+		.select({ id: users.id })
 		.from(users)
 		.where(eq(users.uniqueCode, userUniqueCode))
 		.limit(1);
@@ -702,7 +709,6 @@ app.post("/api/record-attendance", async (c) => {
 	return c.json({
 		created,
 		date: attendanceDate,
-		username: matchedUser.username,
 		message: created
 			? "Attendance recorded"
 			: "Attendance already exists for this UTC+7 date",
