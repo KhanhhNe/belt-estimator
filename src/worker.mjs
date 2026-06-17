@@ -1,5 +1,4 @@
 import { env } from "cloudflare:workers";
-import bcrypt from "bcryptjs";
 import { and, asc, eq, gte, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { Hono } from "hono";
@@ -233,11 +232,13 @@ function getPasswordHashSecret(env) {
 }
 
 async function hashPassword(password, env) {
+	const { default: bcrypt } = await import("bcryptjs");
 	const secret = getPasswordHashSecret(env);
 	return bcrypt.hash(`${password}${secret}`, BCRYPT_SALT_ROUNDS);
 }
 
 async function verifyPassword(password, passwordHash, env) {
+	const { default: bcrypt } = await import("bcryptjs");
 	const secret = getPasswordHashSecret(env);
 	return bcrypt.compare(`${password}${secret}`, passwordHash);
 }
