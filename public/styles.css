@@ -262,6 +262,8 @@ body {
 	font-family: "Consolas", "Courier New", monospace;
 	font-size: 0.84rem;
 	flex: 1;
+	user-select: none;
+	cursor: copy;
 }
 
 .auth-copy-button {

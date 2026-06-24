@@ -143,12 +143,13 @@ function renderAuthUi() {
 		authPanel.innerHTML = "";
 		uniqueCodeFooter.hidden = false;
 		const installerOneLiner = getInstallerOneLiner(currentUser.uniqueCode);
+		const installerOneLinerMasked = getInstallerOneLiner("******");
 		uniqueCodeFooter.innerHTML = `
 			<div class="auth-note auth-note-success unique-code-card">
 				<p class="auth-note-title">User Unique Code</p>
 				<p class="auth-note-text">Use this value for the <strong>User-Unique-Code</strong> header when calling <strong>/api/record-attendance</strong>.</p>
 				<div class="auth-code-row">
-					<input id="user-unique-code" class="auth-input auth-code-input" type="${uniqueCodeVisible ? "text" : "password"}" readonly value="${escapeHtml(currentUser.uniqueCode)}" aria-label="User unique code" />
+					<input id="user-unique-code" class="auth-input auth-code-input" type="${uniqueCodeVisible ? "text" : "password"}" readonly tabindex="-1" title="Click to copy" value="${escapeHtml(currentUser.uniqueCode)}" aria-label="User unique code" />
 					<button type="button" class="auth-button auth-copy-button" data-auth-action="copy-unique-code">Copy</button>
 					<button type="button" class="auth-button auth-eye-button" data-auth-action="toggle-unique-code-visibility" aria-label="${uniqueCodeVisible ? "Hide unique code" : "Show unique code"}">${uniqueCodeVisible ? "🙈" : "👁"}</button>
 				</div>
@@ -157,7 +158,7 @@ function renderAuthUi() {
 				<p class="auth-note-title">PowerShell One-Line Install</p>
 				<p class="auth-note-text">Copy and run this in PowerShell to install auto attendance recording with your own code pre-filled.</p>
 				<div class="auth-code-row">
-					<input id="install-script-oneliner" class="auth-input auth-code-input install-script-input" type="text" readonly value="${escapeHtml(installerOneLiner)}" aria-label="PowerShell one-line install command" />
+					<input id="install-script-oneliner" class="auth-input auth-code-input install-script-input" type="text" readonly tabindex="-1" title="Click to copy" value="${escapeHtml(installerOneLinerMasked)}" aria-label="PowerShell one-line install command" />
 					<button type="button" class="auth-button auth-copy-button" data-auth-action="copy-install-oneliner">Copy</button>
 				</div>
 			</div>
@@ -1180,6 +1181,41 @@ function registerAuthInteractions() {
 			return;
 		}
 
+		const codeInput = event.target.closest("input.auth-code-input");
+		if (codeInput instanceof HTMLInputElement) {
+			if (codeInput.id === "user-unique-code") {
+				try {
+					await navigator.clipboard.writeText(codeInput.value);
+					authPanelMessage = "Unique code copied to clipboard.";
+				} catch {
+					authPanelMessage =
+						"Unable to copy automatically. Please copy manually.";
+				}
+
+				renderAuthUi();
+			}
+
+			if (codeInput.id === "install-script-oneliner") {
+				if (!currentUser?.uniqueCode) {
+					return;
+				}
+
+				try {
+					await navigator.clipboard.writeText(
+						getInstallerOneLiner(currentUser.uniqueCode),
+					);
+					authPanelMessage = "Install command copied to clipboard.";
+				} catch {
+					authPanelMessage =
+						"Unable to copy automatically. Please copy manually.";
+				}
+
+				renderAuthUi();
+			}
+
+			return;
+		}
+
 		const button = event.target.closest("button[data-auth-action]");
 		if (!button) {
 			return;
@@ -1205,13 +1241,14 @@ function registerAuthInteractions() {
 		}
 
 		if (action === "copy-install-oneliner") {
-			const oneLinerInput = document.getElementById("install-script-oneliner");
-			if (!(oneLinerInput instanceof HTMLInputElement)) {
+			if (!currentUser?.uniqueCode) {
 				return;
 			}
 
 			try {
-				await navigator.clipboard.writeText(oneLinerInput.value);
+				await navigator.clipboard.writeText(
+					getInstallerOneLiner(currentUser.uniqueCode),
+				);
 				authPanelMessage = "Install command copied to clipboard.";
 			} catch {
 				authPanelMessage =
@@ -1266,6 +1303,26 @@ function registerAuthInteractions() {
 				adminImpersonationInFlight = false;
 				renderAuthUi();
 			}
+		}
+	});
+
+	uniqueCodeFooter.addEventListener("mousedown", (event) => {
+		if (!(event.target instanceof Element)) {
+			return;
+		}
+
+		if (event.target.closest("input.auth-code-input")) {
+			event.preventDefault();
+		}
+	});
+
+	uniqueCodeFooter.addEventListener("selectstart", (event) => {
+		if (!(event.target instanceof Element)) {
+			return;
+		}
+
+		if (event.target.closest("input.auth-code-input")) {
+			event.preventDefault();
 		}
 	});
 
