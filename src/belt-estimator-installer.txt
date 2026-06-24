@@ -7,8 +7,6 @@ $taskUri = '\BeltEstimator\AttendanceRecordOnWifiChange'
 $marker = 'BELT_ESTIMATOR_ATTENDANCE_V1'
 $scriptPath = Join-Path $HOME 'attendance-record.ps1'
 
-$escapedUserUniqueCode = $UserUniqueCode.Replace("'", "''")
-
 # 1) Always overwrite the worker script
 $attendanceScript = @'
 #requires -Version 5.1
@@ -16,7 +14,7 @@ $attendanceScript = @'
 param()
 
 $ErrorActionPreference = 'Stop'
-$UserUniqueCode = '$escapedUserUniqueCode'
+$UserUniqueCode = '{USER_CODE}'
 $TargetSsidOrProfile = 'MSFTCONNECT'
 $ApiUrl = 'https://belt-estimator.khanhhne.com/api/record-attendance'
 

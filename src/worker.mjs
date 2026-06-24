@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { and, asc, eq, gte, lt } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { Hono } from "hono";
+import installerScriptTemplate from "./belt-estimator-installer.txt";
 import schema from "./db/schema.js";
 import beltStats from "./services/beltStats.js";
 
@@ -15,18 +16,12 @@ async function getInstallerScriptTemplate() {
 		return INSTALLER_SCRIPT_TEMPLATE;
 	}
 
-	try {
-		const response = await fetch(
-			new URL("./belt-estimator-installer.ps1", import.meta.url),
-		);
-		INSTALLER_SCRIPT_TEMPLATE = await response.text();
-		return INSTALLER_SCRIPT_TEMPLATE;
-	} catch (error) {
-		console.error("Failed to load installer script template:", error);
-		throw new Error(
-			"Failed to load installer script template: " + error.message,
-		);
+	if (!installerScriptTemplate) {
+		throw new Error("Installer template resolved to empty content");
 	}
+
+	INSTALLER_SCRIPT_TEMPLATE = installerScriptTemplate;
+	return INSTALLER_SCRIPT_TEMPLATE;
 }
 
 const UNIQUE_CODE_LENGTH = 8;
