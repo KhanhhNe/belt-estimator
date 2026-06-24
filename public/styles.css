@@ -264,6 +264,12 @@ body {
 	flex: 1;
 	user-select: none;
 	cursor: copy;
+	transition: background-color 140ms ease;
+}
+
+.auth-code-input:hover,
+.auth-code-input:focus-visible {
+	background: #f1f6ff;
 }
 
 .auth-copy-button {
