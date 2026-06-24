@@ -11,8 +11,13 @@
 		"skipLibCheck": true,
 		"esModuleInterop": true,
 		"forceConsistentCasingInFileNames": true,
-		"lib": ["ES2022", "DOM"],
-		"types": ["node"]
+		"lib": [
+			"ES2022",
+			"DOM"
+		],
+		"types": [
+			"node"
+		]
 	},
 	"include": [
 		"src/**/*.js",
@@ -22,5 +27,8 @@
 		"public/**/*.js",
 		"drizzle.config.js"
 	],
-	"exclude": ["node_modules", "drizzle"]
+	"exclude": [
+		"node_modules",
+		"drizzle"
+	]
 }
