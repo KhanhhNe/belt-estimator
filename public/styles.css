@@ -33,7 +33,6 @@ body {
 	width: min(1100px, 100% - 1.25rem);
 	margin: 0 auto;
 	padding: 0.85rem 0 1rem;
-	min-height: 100dvh;
 	max-width: 60rem;
 	display: flex;
 	flex-direction: column;
@@ -275,6 +274,38 @@ body {
 	min-width: 2.5rem;
 	padding-left: 0.6rem;
 	padding-right: 0.6rem;
+}
+
+.install-script-card {
+	margin-top: 0.7rem;
+	border-color: #c9d8fb;
+	background: #f4f7ff;
+}
+
+.install-script-input {
+	font-size: 0.78rem;
+}
+
+@keyframes shimmer {
+	0% {
+		background-position: -1000px 0;
+	}
+	100% {
+		background-position: 1000px 0;
+	}
+}
+
+.skeleton {
+	animation: shimmer 2s infinite;
+	background: linear-gradient(to right, #e0e7ff 0%, #f0f5ff 50%, #e0e7ff 100%);
+	background-size: 1000px 100%;
+}
+
+.skeleton-code-input {
+	height: 2.5rem;
+	border-radius: 6px;
+	flex: 1;
+	min-width: 0;
 }
 
 .stats-shell {

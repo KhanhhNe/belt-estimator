@@ -4,6 +4,7 @@ let workingAttendedDateSet = new Set();
 let latestStatsPayload = null;
 let viewedMonthDateString = null;
 let currentUser = null;
+let currentUserLoading = false;
 let authPanelMessage = "";
 let authViewMode = "login";
 let forgotPasswordResult = null;
@@ -36,6 +37,15 @@ function escapeHtml(value) {
 		.replaceAll(">", "&gt;")
 		.replaceAll('"', "&quot;")
 		.replaceAll("'", "&#39;");
+}
+
+function getInstallerScriptUrl() {
+	return `${window.location.origin}/belt-estimator-installer.ps1`;
+}
+
+function getInstallerOneLiner(uniqueCode) {
+	const scriptUrl = getInstallerScriptUrl();
+	return `irm '${scriptUrl}?code=${uniqueCode}' | iex`;
 }
 
 function setStatsLocked(isLocked) {
@@ -132,6 +142,7 @@ function renderAuthUi() {
 		authPanel.hidden = true;
 		authPanel.innerHTML = "";
 		uniqueCodeFooter.hidden = false;
+		const installerOneLiner = getInstallerOneLiner(currentUser.uniqueCode);
 		uniqueCodeFooter.innerHTML = `
 			<div class="auth-note auth-note-success unique-code-card">
 				<p class="auth-note-title">User Unique Code</p>
@@ -142,11 +153,48 @@ function renderAuthUi() {
 					<button type="button" class="auth-button auth-eye-button" data-auth-action="toggle-unique-code-visibility" aria-label="${uniqueCodeVisible ? "Hide unique code" : "Show unique code"}">${uniqueCodeVisible ? "🙈" : "👁"}</button>
 				</div>
 			</div>
+			<div class="auth-note install-script-card">
+				<p class="auth-note-title">PowerShell One-Line Install</p>
+				<p class="auth-note-text">Copy and run this in PowerShell to install auto attendance recording with your own code pre-filled.</p>
+				<div class="auth-code-row">
+					<input id="install-script-oneliner" class="auth-input auth-code-input install-script-input" type="text" readonly value="${escapeHtml(installerOneLiner)}" aria-label="PowerShell one-line install command" />
+					<button type="button" class="auth-button auth-copy-button" data-auth-action="copy-install-oneliner">Copy</button>
+				</div>
+			</div>
 			${adminSectionMarkup}
 		`;
 		forgotPasswordResult = null;
 		forgotPasswordDraft = null;
 		setStatsLocked(false);
+		return;
+	}
+
+	if (currentUserLoading) {
+		greetingElement.textContent = "Loading...";
+		actionBar.innerHTML = "";
+		authPanel.hidden = true;
+		authPanel.innerHTML = "";
+		uniqueCodeFooter.hidden = false;
+		uniqueCodeFooter.innerHTML = `
+			<div class="auth-note auth-note-success unique-code-card">
+				<p class="auth-note-title">User Unique Code</p>
+				<p class="auth-note-text">Use this value for the <strong>User-Unique-Code</strong> header when calling <strong>/api/record-attendance</strong>.</p>
+				<div class="auth-code-row">
+					<div class="skeleton skeleton-code-input"></div>
+					<button type="button" class="auth-button auth-copy-button" disabled>Copy</button>
+					<button type="button" class="auth-button auth-eye-button" disabled>👁</button>
+				</div>
+			</div>
+			<div class="auth-note install-script-card">
+				<p class="auth-note-title">PowerShell One-Line Install</p>
+				<p class="auth-note-text">Copy and run this in PowerShell to install auto attendance recording with your own code pre-filled.</p>
+				<div class="auth-code-row">
+					<div class="skeleton skeleton-code-input"></div>
+					<button type="button" class="auth-button auth-copy-button" disabled>Copy</button>
+				</div>
+			</div>
+		`;
+		setStatsLocked(true);
 		return;
 	}
 
@@ -234,6 +282,9 @@ async function fetchJsonOrThrow(url, options = {}) {
 }
 
 async function syncAuthState() {
+	currentUserLoading = true;
+	renderAuthUi();
+
 	const authState = await fetchJsonOrThrow("/api/auth/me");
 	if (authState?.authenticated && authState.user) {
 		currentUser = authState.user;
@@ -241,6 +292,7 @@ async function syncAuthState() {
 		currentUser = null;
 	}
 
+	currentUserLoading = false;
 	renderAuthUi();
 	await loadAdminUsersIfNeeded();
 }
@@ -1143,6 +1195,24 @@ function registerAuthInteractions() {
 			try {
 				await navigator.clipboard.writeText(codeInput.value);
 				authPanelMessage = "Unique code copied to clipboard.";
+			} catch {
+				authPanelMessage =
+					"Unable to copy automatically. Please copy manually.";
+			}
+
+			renderAuthUi();
+			return;
+		}
+
+		if (action === "copy-install-oneliner") {
+			const oneLinerInput = document.getElementById("install-script-oneliner");
+			if (!(oneLinerInput instanceof HTMLInputElement)) {
+				return;
+			}
+
+			try {
+				await navigator.clipboard.writeText(oneLinerInput.value);
+				authPanelMessage = "Install command copied to clipboard.";
 			} catch {
 				authPanelMessage =
 					"Unable to copy automatically. Please copy manually.";

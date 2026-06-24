@@ -7,6 +7,28 @@ import beltStats from "./services/beltStats.js";
 
 const { attendanceRecords, sessions, users } = schema;
 const { calculateBeltStats, fetchAttendedDateStrings } = beltStats;
+
+let INSTALLER_SCRIPT_TEMPLATE = null;
+
+async function getInstallerScriptTemplate() {
+	if (INSTALLER_SCRIPT_TEMPLATE !== null) {
+		return INSTALLER_SCRIPT_TEMPLATE;
+	}
+
+	try {
+		const response = await fetch(
+			new URL("./belt-estimator-installer.ps1", import.meta.url),
+		);
+		INSTALLER_SCRIPT_TEMPLATE = await response.text();
+		return INSTALLER_SCRIPT_TEMPLATE;
+	} catch (error) {
+		console.error("Failed to load installer script template:", error);
+		throw new Error(
+			"Failed to load installer script template: " + error.message,
+		);
+	}
+}
+
 const UNIQUE_CODE_LENGTH = 8;
 const UNIQUE_CODE_CHARSET =
 	"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -104,6 +126,7 @@ async function getSessionFromRequest(c) {
 			id: sessions.sessionId,
 			userId: sessions.userId,
 			username: users.username,
+			uniqueCode: users.uniqueCode,
 			isAdmin: users.isAdmin,
 			createdAt: sessions.createdAt,
 		})
@@ -204,6 +227,7 @@ async function getAuthenticatedUserFromRequest(c) {
 		user: {
 			id: session.userId,
 			username: session.username,
+			uniqueCode: session.uniqueCode,
 			isAdmin: Boolean(session.isAdmin),
 		},
 	};
@@ -846,6 +870,28 @@ app.get("/api/stats", async (c) => {
 	);
 	const { currentDate, ...stats } = calculateBeltStats(attendedDateStrings);
 	return c.json(stats);
+});
+
+app.get("/belt-estimator-installer.ps1", async (c) => {
+	const userCode = c.req.query("code")?.trim();
+	if (!userCode) {
+		return c.text("Error: missing 'code' query parameter", 400);
+	}
+
+	try {
+		const template = await getInstallerScriptTemplate();
+		const escapedCode = userCode.replace(/'/g, "''");
+		const script = template.replace("{USER_CODE}", escapedCode);
+		c.header("Content-Type", "application/x-powershell");
+		c.header(
+			"Content-Disposition",
+			'attachment; filename="belt-estimator-installer.ps1"',
+		);
+		return c.text(script);
+	} catch (error) {
+		console.error("Failed to generate installer script:", error);
+		return c.text("Error: Failed to generate installer script", 500);
+	}
 });
 
 app.all("/api/*", (c) => {
