@@ -1,5 +1,9 @@
 # belt-estimator
 
+BELT Estimator transforms BELT policy from a black box into instant clarity - showing employees exactly how many days they can work from home guilt-free, so they reclaim their schedule.
+
+## Overview
+
 BELT attendance dashboard with an Express.js backend running directly on Cloudflare Workers.
 
 ## Prerequisites
