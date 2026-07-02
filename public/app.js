@@ -22,6 +22,7 @@ let monthAttendanceInFlight = false;
 let monthAttendanceLoadRequestId = 0;
 const monthAttendanceCache = new Map();
 const pendingPersistenceOperations = new Map();
+let latestD1Bookmark = "first-unconstrained";
 
 const ATTENDANCE_PREVIEW_DEBOUNCE_MS = 300;
 
@@ -267,7 +268,7 @@ function renderAuthUi() {
 }
 
 async function fetchJsonOrThrow(url, options = {}) {
-	const response = await fetch(url, options);
+	const response = await fetchApiResponse(url, options);
 	let payload = null;
 
 	try {
@@ -283,6 +284,26 @@ async function fetchJsonOrThrow(url, options = {}) {
 	}
 
 	return payload;
+}
+
+async function fetchApiResponse(url, options = {}) {
+	const headers = new Headers(options.headers ?? {});
+	if (latestD1Bookmark) {
+		headers.set("x-d1-bookmark", latestD1Bookmark);
+	}
+
+	const response = await fetch(url, {
+		...options,
+		headers,
+		cache: "no-store",
+	});
+
+	const responseBookmark = response.headers.get("x-d1-bookmark");
+	if (responseBookmark) {
+		latestD1Bookmark = responseBookmark;
+	}
+
+	return response;
 }
 
 async function syncAuthState() {
@@ -361,7 +382,7 @@ async function loadStats() {
 	}
 
 	try {
-		const response = await fetch("/api/stats");
+		const response = await fetchApiResponse("/api/stats");
 		if (!response.ok) {
 			if (response.status === 401) {
 				currentUser = null;
@@ -832,7 +853,7 @@ async function recalculatePreviewStats(attendedDateStrings) {
 		throw new Error("Authentication required");
 	}
 
-	const response = await fetch("/api/stats/preview", {
+	const response = await fetchApiResponse("/api/stats/preview", {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
@@ -921,7 +942,7 @@ async function persistAttendanceToggle(dateString) {
 		throw new Error("Authentication required");
 	}
 
-	const response = await fetch("/api/attendance/toggle", {
+	const response = await fetchApiResponse("/api/attendance/toggle", {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
